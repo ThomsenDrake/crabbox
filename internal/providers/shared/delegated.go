@@ -72,6 +72,41 @@ type DelegatedSandboxLifecycle struct {
 	Cleanup    func(context.Context) error
 }
 
+// FinalizeDelegatedCommandOutcome interprets a provider's command response.
+// Transport errors do not establish command exits, regardless of numeric code.
+func FinalizeDelegatedCommandOutcome(exitCode int, err error) core.RunResult {
+	if err == nil {
+		return core.FinalizeRunResult(core.RunResult{ExitCode: exitCode}, nil)
+	}
+	if _, observed := err.(observedProcessEndError); observed {
+		if exitCode == 0 {
+			exitCode = 1
+		}
+		return core.RunResult{ExitCode: exitCode, Status: core.RunStatusFailed, ErrorKind: core.RunErrorCommandExit}
+	}
+	outcome := core.FinalizeRunResult(core.RunResult{}, err)
+	outcome.ExitCode = 1
+	return outcome
+}
+
+// AppendDelegatedRunFailure adds a terminal cleanup or reporting failure to an
+// already classified primary outcome. A first failure selects firstCode and a
+// provider-error result; later failures preserve the primary code/status and
+// expose each safe error message without formatting hidden underlying causes.
+func AppendDelegatedRunFailure(result core.RunResult, primary, secondary error, firstCode int) (core.RunResult, error) {
+	if secondary == nil {
+		return result, primary
+	}
+	if primary == nil {
+		result.ExitCode = firstCode
+		result.Status, result.ErrorKind = core.RunStatusFailed, core.RunErrorProvider
+		return result, ExitErrorWithCause(firstCode, secondary.Error(), secondary)
+	}
+	joined := errors.Join(primary, secondary)
+	// The CLI prints the selected ExitError message, not the joined error.
+	return result, ExitErrorWithCause(result.ExitCode, joined.Error(), joined)
+}
+
 // RunDelegatedSandbox owns the single sandbox run sequence and finalization.
 // The first failure determines the exit code/status; later cleanup failures are
 // joined as diagnostics. Sandbox cleanup alone fails with code 1. A failed deletion
@@ -129,16 +164,7 @@ func RunDelegatedSandbox(ctx context.Context, req core.RunRequest, lifecycle Del
 			retErr = ExitErrorWithCause(result.ExitCode, retErr.Error(), retErr)
 		}
 		appendFailure := func(err error, firstCode int) {
-			if err == nil {
-				return
-			}
-			if retErr == nil {
-				result.ExitCode = firstCode
-				result.Status, result.ErrorKind = core.RunStatusFailed, core.RunErrorProvider
-				retErr = ExitErrorWithCause(firstCode, err.Error(), err)
-			} else {
-				retErr = errors.Join(retErr, err)
-			}
+			result, retErr = AppendDelegatedRunFailure(result, retErr, err, firstCode)
 		}
 		if command.Close != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
@@ -275,23 +301,12 @@ func RunDelegatedSandbox(ctx context.Context, req core.RunRequest, lifecycle Del
 	result.ExitCode, err = command.Run(ctx)
 	result.Command = now().Sub(commandStarted)
 	commandRan = true
+	outcome := FinalizeDelegatedCommandOutcome(result.ExitCode, err)
+	result.ExitCode, result.Status, result.ErrorKind = outcome.ExitCode, outcome.Status, outcome.ErrorKind
 	if err != nil {
-		if _, observed := err.(observedProcessEndError); observed {
-			if result.ExitCode == 0 {
-				result.ExitCode = 1
-			}
-			result.Status, result.ErrorKind = core.RunStatusFailed, core.RunErrorCommandExit
-			return result, ExitErrorWithCause(result.ExitCode, fmt.Sprintf("%s run failed: %v", lifecycle.Provider, RedactErrorSecrets(err.Error())), err)
-		}
-		// Transport errors are not command exits, even if the API also reports
-		// a nonzero process code. Preserve context causes for normalization.
-		outcome := core.FinalizeRunResult(core.RunResult{}, err)
-		result.ExitCode = 1
-		result.Status, result.ErrorKind = outcome.Status, outcome.ErrorKind
-		return result, ExitErrorWithCause(1, fmt.Sprintf("%s run failed: %v", lifecycle.Provider, RedactErrorSecrets(err.Error())), err)
+		return result, ExitErrorWithCause(result.ExitCode, fmt.Sprintf("%s run failed: %v", lifecycle.Provider, RedactErrorSecrets(err.Error())), err)
 	}
 	if result.ExitCode != 0 {
-		result = core.FinalizeRunResult(result, nil)
 		return result, core.ExitError{Code: result.ExitCode, Message: fmt.Sprintf("%s run exited %d", lifecycle.Provider, result.ExitCode)}
 	}
 	return result, nil

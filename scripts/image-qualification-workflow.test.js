@@ -36,11 +36,21 @@ test("workflow isolates candidate execution from protected credentials", () => {
   assert.match(buildJob, /npm ci --prefix harness\/worker --ignore-scripts/);
   assert.match(buildJob, /image-qualification-control\.mjs prepare-build/);
   assert.match(buildJob, /GOTOOLCHAIN=local GOWORK=off CGO_ENABLED=0 GOFLAGS=-mod=readonly/);
-  assert.match(buildJob, /go build -trimpath/);
+  assert.match(buildJob, /go build -trimpath -ldflags='-s -w'/);
   assert.match(buildJob, /\.\/node_modules\/\.bin\/wrangler deploy --dry-run/);
   assert.match(buildJob, /image-qualification-control\.mjs manifest/);
   assert.match(buildJob, /build-inputs\.json/);
-  assert.match(buildJob, /cache: false/g);
+  const setupGo = buildJob.slice(
+    buildJob.indexOf("      - name: Set up Go"),
+    buildJob.indexOf("      - name: Set up Node"),
+  );
+  const setupNode = buildJob.slice(
+    buildJob.indexOf("      - name: Set up Node"),
+    buildJob.indexOf("      - name: Install protected Worker toolchain"),
+  );
+  assert.match(setupGo, /cache: false/);
+  assert.doesNotMatch(setupNode, /^\s+cache:/m);
+  assert.match(setupNode, /package-manager-cache: false/);
   assert.match(
     buildJob,
     /AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN CLOUDFLARE_API_TOKEN QUALIFICATION_CONTROLLER_TOKEN/,
@@ -50,7 +60,7 @@ test("workflow isolates candidate execution from protected credentials", () => {
   assert.doesNotMatch(workflow, /seal-candidate|image-qualification-candidate-raw/);
   const buildOrder = [
     "image-qualification-control.mjs prepare-build",
-    "go build -trimpath",
+    "go build -trimpath -ldflags='-s -w'",
     "./node_modules/.bin/wrangler deploy --dry-run",
     "image-qualification-control.mjs manifest",
     "Upload immutable candidate bundle",
@@ -90,6 +100,37 @@ test("workflow isolates candidate execution from protected credentials", () => {
   const protectedJobs = workflow.slice(workflow.indexOf("  deploy-enroll:"));
   assert.doesNotMatch(protectedJobs, /npm ci|go build|wrangler deploy/);
   assert.match(protectedJobs, /candidate bytes as inert data/);
+});
+
+test("candidate downloads extract the artifact at the canonical path", () => {
+  const downloadSteps = [...workflow.matchAll(
+    /^      - name: [^\n]+\n        uses: actions\/download-artifact@[^\n]+\n        with:\n((?:          .+\n)+)/gm,
+  )];
+  const candidateDownloads = downloadSteps.filter(([, inputs]) =>
+    inputs.includes("artifact-ids:"),
+  );
+
+  assert.equal(candidateDownloads.length, 3);
+  for (const [, inputs] of candidateDownloads) {
+    assert.match(
+      inputs,
+      /^          artifact-ids: \$\{\{ needs\.build-candidate\.outputs\.candidate_artifact_id \}\}$/m,
+    );
+    assert.match(
+      inputs,
+      /^          path: \$\{\{ runner\.temp \}\}\/image-qualification-candidate$/m,
+    );
+    assert.match(inputs, /^          merge-multiple: true$/m);
+  }
+});
+
+test("finalization skips protected approval when deployment never started", () => {
+  const finalizeJob = workflow.slice(workflow.indexOf("  finalize:"));
+
+  assert.match(
+    finalizeJob,
+    /^    if: \$\{\{ always\(\) && needs\.deploy-enroll\.result != 'skipped' \}\}$/m,
+  );
 });
 
 test("all workflow actions use immutable repository-standard pins", () => {
@@ -222,14 +263,25 @@ test("protected build prep binds source, rejects substitution, and seals exact b
     fs.mkdirSync(path.join(artifact, "bin"), { recursive: true });
     fs.mkdirSync(path.join(artifact, "worker"), { recursive: true });
     fs.writeFileSync(path.join(artifact, "bin", "crabbox"), "candidate-cli");
+    fs.truncateSync(path.join(artifact, "bin", "crabbox"), 65 * 1024 * 1024);
     fs.writeFileSync(path.join(artifact, "worker", "index.js"), "export default {};");
     const manifest = module.createManifest(candidate, artifact, candidateSha, workflowSha);
+    assert.equal(
+      manifest.files.find((entry) => entry.path === "bin/crabbox")?.bytes,
+      65 * 1024 * 1024,
+    );
     assert.equal(
       module.verifyManifest(artifact, candidateSha, workflowSha).manifestSha256,
       manifest.manifestSha256,
     );
     fs.writeFileSync(path.join(artifact, "unexpected"), "nope");
     assert.throws(() => module.verifyManifest(artifact, candidateSha, workflowSha), /extra files/);
+    fs.rmSync(path.join(artifact, "unexpected"));
+    fs.truncateSync(path.join(artifact, "worker", "index.js"), 64 * 1024 * 1024);
+    assert.throws(
+      () => module.createManifest(candidate, artifact, candidateSha, workflowSha),
+      /candidate artifact exceeds the file or byte limit/,
+    );
 
     fs.writeFileSync(
       path.join(candidate, "worker", "package.json"),

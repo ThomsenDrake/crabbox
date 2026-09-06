@@ -35,6 +35,75 @@ func TestExitErrorWithCausePreservesSelectedCodeAndMessage(t *testing.T) {
 	}
 }
 
+func TestAppendDelegatedRunFailurePreservesSelectedOutcome(t *testing.T) {
+	primaryCause := errors.New("hidden primary detail")
+	secondaryCause := errors.New("hidden secondary detail")
+	primary := ExitErrorWithCause(23, "safe primary", primaryCause)
+	secondary := ExitErrorWithCause(9, "safe secondary", secondaryCause)
+	for _, tc := range []struct {
+		name                 string
+		primary, secondary   error
+		beforeCode, wantCode int
+	}{
+		{name: "first failure", secondary: secondary, wantCode: 5},
+		{name: "secondary failure", primary: primary, secondary: secondary, beforeCode: 23, wantCode: 23},
+		{name: "no secondary", primary: primary, beforeCode: 23, wantCode: 23},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := core.FinalizeRunResult(core.RunResult{Provider: "fixture", LeaseID: "lease", Total: time.Second, Session: &core.RunSessionHandle{Kept: true}, ExitCode: tc.beforeCode}, tc.primary)
+			result, err := AppendDelegatedRunFailure(before, tc.primary, tc.secondary, 5)
+			var public core.ExitError
+			if !errors.As(err, &public) || public.Code != tc.wantCode || result.ExitCode != tc.wantCode || result.Status != core.RunStatusFailed {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if tc.primary != nil && (!errors.Is(err, primaryCause) || !strings.Contains(public.Message, "safe primary")) {
+				t.Fatalf("primary lost: %v", err)
+			}
+			if tc.secondary != nil && (!errors.Is(err, secondaryCause) || !strings.Contains(public.Message, "safe secondary")) {
+				t.Fatalf("secondary lost: %v", err)
+			}
+			if strings.Contains(err.Error(), "hidden") {
+				t.Fatalf("unsafe cause exposed: %v", err)
+			}
+			want := before
+			want.ExitCode = tc.wantCode
+			if tc.primary == nil {
+				want.Status = core.RunStatusFailed
+				want.ErrorKind = core.RunErrorProvider
+			}
+			if !reflect.DeepEqual(result, want) {
+				t.Fatalf("unrelated state changed: result=%+v want=%+v", result, want)
+			}
+			if tc.secondary == nil && err != tc.primary {
+				t.Fatal("nil failure replaced the primary error")
+			}
+		})
+	}
+}
+
+func TestDelegatedSandboxSecondaryDiagnosticsKeepSafeMessages(t *testing.T) {
+	primary := errors.New("raw execution detail")
+	secondary := errors.New("raw cleanup detail")
+	result, err := RunDelegatedSandbox(t.Context(), core.RunRequest{NoSync: true, Keep: true}, DelegatedSandboxLifecycle{
+		Provider: "test",
+		Acquire:  func(context.Context) (DelegatedSandbox, error) { return DelegatedSandbox{LeaseID: "lease"}, nil },
+		NoSync:   func(context.Context) error { return nil },
+		Command: func(context.Context) (DelegatedSandboxCommand, error) {
+			return DelegatedSandboxCommand{
+				Run:   func(context.Context) (int, error) { return 1, ExitErrorWithCause(1, "safe execution", primary) },
+				Close: func(context.Context) error { return ExitErrorWithCause(5, "safe cleanup", secondary) },
+			}, nil
+		},
+	})
+	var public core.ExitError
+	if !core.AsExitError(err, &public) || public.Code != 1 || result.ExitCode != 1 || !errors.Is(err, primary) || !errors.Is(err, secondary) {
+		t.Fatalf("selected code or causes lost: result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(public.Message, "safe execution") || !strings.Contains(public.Message, "safe cleanup") || strings.Contains(public.Message, "raw ") || strings.Contains(err.Error(), "raw ") {
+		t.Fatalf("safe diagnostics were lost or underlying details exposed: message=%q err=%v", public.Message, err)
+	}
+}
+
 func TestDelegatedSandboxLifecycle(t *testing.T) {
 	failure := errors.New("phase failed")
 	cleanupFailure := errors.New("delete unavailable")
@@ -227,6 +296,11 @@ func TestDelegatedSandboxLifecycle(t *testing.T) {
 				if !errors.As(err, &ee) || ee.Code != tc.wantCode {
 					t.Fatalf("exit error=%v", err)
 				}
+				for _, secondary := range []error{tc.closeErr, tc.cleanupErr} {
+					if secondary != nil && !strings.Contains(ee.Message, secondary.Error()) {
+						t.Fatalf("CLI exit message lost cleanup diagnostic: message=%q secondary=%v", ee.Message, secondary)
+					}
+				}
 			}
 			count := 0
 			for _, call := range calls {
@@ -366,6 +440,9 @@ func TestDelegatedSandboxTimingWriterFailureDoesNotSkipCleanupOrMaskExit(t *test
 			var ee core.ExitError
 			if !errors.Is(err, io.ErrClosedPipe) || !errors.As(err, &ee) || ee.Code != wantCode || result.ExitCode != wantCode || calls != wantCleanup {
 				t.Fatalf("calls=%d result=%#v err=%v", calls, result, err)
+			}
+			if !strings.Contains(ee.Message, io.ErrClosedPipe.Error()) {
+				t.Fatalf("CLI exit message lost timing diagnostic: %q", ee.Message)
 			}
 		})
 	}

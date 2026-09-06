@@ -104,6 +104,17 @@ Defaults: image `alpine` (lightweight; provides the standard shell tools needed 
 
 Note: `warmup` always keeps the sandbox until an explicit `crabbox stop`. If you pass `--keep=false` to `warmup`, Crabbox prints a warning and still keeps it.
 
+Run finalization uses Crabbox's shared sandbox lifecycle. Automatic deletion or
+deletion-confirmation failure after a successful command returns exit 1 with a
+provider-error result, retaining the session and claim for recovery. A primary
+command, transport, or cancellation failure keeps its outcome when later cleanup
+or timing output also fails; secondary diagnostics remain visible in the CLI.
+Timing reflects final cleanup disposition when it can be written. A timing-write
+failure after successful deletion cannot retroactively retain the machine.
+`--keep-on-failure` also applies to workspace or environment preparation failures
+after acquisition. Reused machines stay kept, and `smolvm.keep: true` has the same
+all-outcomes retention and non-ephemeral creation policy as `--keep`.
+
 Fresh runs upload the snapshot prepared before allocation, even if the checkout
 changes during startup. Reused runs authorize the existing machine before local
 preparation; manifest, full-archive guardrail, and archive-construction failures
@@ -127,6 +138,21 @@ replacement behavior. `--no-sync` creates the workdir without clearing it.
 Stream errors retain their cancellation or timeout cause for run status. Crabbox checks cancellation immediately before submitting the command, including after a successful environment upload; existing profile cleanup still runs.
 
 Deletion and reuse require that exact local claim and a fresh matching machine response. Crabbox holds the unchanged claim through deletion and confirmed absence; run teardown and failed-start rollback use the same ownership checks with a fresh 60-second cleanup budget. Explicit stop preserves caller cancellation within that budget. A concurrent claim change, changed machine identity, failed delete, or uncertain confirmation retains the claim and reports the cleanup problem.
+
+Environment-profile cleanup remains warning-only and runs first with its own
+uncanceled 30-second budget, including after partial upload; machine teardown
+then receives a fresh 60-second budget that includes its claim-lock wait. A
+shorter explicit-stop caller deadline still applies. Ownership publication and
+reuse waits also honor caller cancellation. Failed-create rollback uses its own
+detached 60-second budget, including an absent-claim fence when publication did
+not complete; an appearing claim still vetoes deletion. Cleanup expiry before
+fence admission performs no cleanup call and leaves the claim or unclaimed
+machine for inspection. Rollback failure preserves the acquisition's CLI exit and both
+error causes.
+
+Completed fenced actions still finish their durable writes after late
+cancellation. Read-only discovery keeps its existing policy, and local
+filesystem syscalls are not forcibly interruptible.
 
 Older claims without the machine ID, endpoint, and creation timestamp do not authorize stop or reuse. Name-matched machines remain discoverable through `list` and `status`, which do not create or upgrade claims. `--reclaim` transfers repository ownership of an already proven binding; it never adopts an unclaimed or legacy machine. Review those machines in the provider console before any manual cleanup, or create a new lease for reuse.
 

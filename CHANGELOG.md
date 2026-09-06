@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Daytona: support fixed warmup and checkpoint-fork IDs with durable, organization-bound replay and cleanup, preserving original lease deadlines and explicit repository transfers without recreating released operations. [PR 1700](https://github.com/openclaw/crabbox/pull/1700). Thanks @steipete.
 - Azure: expose read-only, lease-scoped cleanup identity diagnostics so blocked deletion can be investigated without changing claims, bypassing ownership guards, or accessing provider credentials locally. [PR 1889](https://github.com/openclaw/crabbox/pull/1889). Thanks @steipete.
 - Upstash Box: share run finalization so early failures honor `--keep-on-failure`, failed deletion reports a kept recovery session, and cleanup/timing errors preserve the primary exit; keep delegated command receipts when secondary cleanup fails. [PR 1885](https://github.com/openclaw/crabbox/pull/1885). Thanks @steipete.
 - Make `sync-plan --json` preview the configured provider's full-archive or dirty-delta guardrails accurately, without credentials or provider API calls. [PR 1882](https://github.com/openclaw/crabbox/pull/1882). Thanks @steipete.

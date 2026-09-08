@@ -26359,6 +26359,10 @@ describe("fleet lease identity and idle", () => {
 
       const recovered = await f.recover(inspected.inspection.claimFingerprint);
       expect(recovered.status).toBe(200);
+      expect(f.lookupAttributes).toEqual([
+        [{ AttributeKey: "ResourceName", AttributeValue: f.lease.cloudID }],
+        [{ AttributeKey: "ResourceName", AttributeValue: f.lease.cloudID }],
+      ]);
       const repair = (await recovered.json()) as { recovery: Record<string, unknown> };
       expect(Object.keys(repair.recovery).toSorted()).toEqual([
         "actor",
@@ -26401,6 +26405,7 @@ describe("fleet lease identity and idle", () => {
       });
       await f.fleet.alarm();
       expect(f.state.keyDeleted).toBe(true);
+      expect(f.deletedKeyIDs).toEqual(["key-0123456789abcdef0", "key-0123456789abcdef0"]);
       expect(f.storage.value(key)).toMatchObject({
         state: "released",
         keep,
@@ -49907,6 +49912,8 @@ function awsLegacyRecoveryFixture(keep = false) {
   };
   const actions: string[] = [];
   const credentialKeys: string[] = [];
+  const lookupAttributes: unknown[] = [];
+  const deletedKeyIDs: Array<string | null> = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -49917,9 +49924,7 @@ function awsLegacyRecoveryFixture(keep = false) {
       if (outgoing.headers.get("x-amz-target")?.endsWith(".LookupEvents")) {
         actions.push("LookupEvents");
         const lookup = (await outgoing.json()) as Record<string, unknown>;
-        expect(lookup.LookupAttributes).toEqual([
-          { AttributeKey: "ResourceName", AttributeValue: lease.cloudID },
-        ]);
+        lookupAttributes.push(lookup.LookupAttributes);
         state.beforeLookup?.();
         if (state.lookupError) throw new Error("private-bootstrap-canary");
         return new Response(
@@ -49953,7 +49958,7 @@ function awsLegacyRecoveryFixture(keep = false) {
         );
       }
       if (action === "DeleteKeyPair") {
-        expect(params.get("KeyPairId")).toBe("key-0123456789abcdef0");
+        deletedKeyIDs.push(params.get("KeyPairId"));
         if (state.keyFailure)
           return ec2XMLResponse(
             "<Response><Errors><Error><Code>UnauthorizedOperation</Code></Error></Errors></Response>",
@@ -49966,7 +49971,7 @@ function awsLegacyRecoveryFixture(keep = false) {
     }),
   );
   let credentialGeneration = 0;
-  const credentials = vi.fn(async () => ({
+  const credentials = vi.fn<NonNullable<Env["awsCredentialProvider"]>>(async () => ({
     accessKeyId: `test-${++credentialGeneration}`,
     secretAccessKey: "test",
   }));
@@ -49999,6 +50004,8 @@ function awsLegacyRecoveryFixture(keep = false) {
     actions,
     credentialKeys,
     credentials,
+    lookupAttributes,
+    deletedKeyIDs,
     fleet,
     headers,
     inspect,

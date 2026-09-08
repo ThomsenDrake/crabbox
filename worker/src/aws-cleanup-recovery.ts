@@ -171,16 +171,16 @@ export async function lookupAWSLegacyAllocation(
     const payload = await readLookupResponse(response, remainingBytes);
     remainingBytes -= payload.bytes;
     const result = record(payload.value);
-    if (!Array.isArray(result.Events) || result.Events.length > 50) invalidEvidence();
-    for (const value of result.Events) {
+    if (!Array.isArray(result["Events"]) || result["Events"].length > 50) invalidEvidence();
+    for (const value of result["Events"]) {
       const summary = record(value);
-      if (summary.EventName !== "RunInstances") continue;
+      if (summary["EventName"] !== "RunInstances") continue;
       const observed = allocationEvidence(summary, lease, account, start, end);
       const previous = evidence.get(observed.eventID);
       if (previous && JSON.stringify(previous) !== JSON.stringify(observed)) invalidEvidence();
       evidence.set(observed.eventID, observed);
     }
-    if (result.NextToken === undefined || result.NextToken === "") {
+    if (result["NextToken"] === undefined || result["NextToken"] === "") {
       if (evidence.size !== 1) {
         throw new ProviderResourceUnresolvedError(
           "AWS CloudTrail did not establish one unambiguous original allocation; no scope was recovered",
@@ -189,12 +189,12 @@ export async function lookupAWSLegacyAllocation(
       return evidence.values().next().value!;
     }
     if (
-      typeof result.NextToken !== "string" ||
-      result.NextToken.length > 16_384 ||
-      tokens.has(result.NextToken)
+      typeof result["NextToken"] !== "string" ||
+      result["NextToken"].length > 16_384 ||
+      tokens.has(result["NextToken"])
     )
       invalidEvidence();
-    nextToken = result.NextToken;
+    nextToken = result["NextToken"];
     tokens.add(nextToken);
     // oxlint-disable-next-line eslint/no-await-in-loop -- CloudTrail permits two lookups per second per account and Region.
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -211,66 +211,66 @@ function allocationEvidence(
   start: number,
   end: number,
 ): AWSLegacyAllocationEvidence {
-  if (typeof summary.CloudTrailEvent !== "string") invalidEvidence();
+  if (typeof summary["CloudTrailEvent"] !== "string") invalidEvidence();
   let event: Record<string, unknown>;
   try {
-    event = record(JSON.parse(summary.CloudTrailEvent));
+    event = record(JSON.parse(summary["CloudTrailEvent"]));
   } catch {
     return invalidEvidence();
   }
-  const eventTime = typeof event.eventTime === "string" ? Date.parse(event.eventTime) : NaN;
-  const response = record(event.responseElements);
-  const instances = record(response.instancesSet).items;
-  const request = record(event.requestParameters);
-  const specifications = record(request.tagSpecificationSet).items;
+  const eventTime = typeof event["eventTime"] === "string" ? Date.parse(event["eventTime"]) : NaN;
+  const response = record(event["responseElements"]);
+  const instances = record(response["instancesSet"])["items"];
+  const request = record(event["requestParameters"]);
+  const specifications = record(request["tagSpecificationSet"])["items"];
   if (
-    event.eventName !== "RunInstances" ||
-    event.eventSource !== "ec2.amazonaws.com" ||
-    event.eventType !== "AwsApiCall" ||
-    event.errorCode ||
-    event.errorMessage ||
-    event.recipientAccountId !== account ||
-    event.awsRegion !== lease.region ||
-    typeof event.eventID !== "string" ||
-    !/^[a-f0-9-]{36}$/.test(event.eventID) ||
-    summary.EventId !== event.eventID ||
-    summary.EventSource !== event.eventSource ||
+    event["eventName"] !== "RunInstances" ||
+    event["eventSource"] !== "ec2.amazonaws.com" ||
+    event["eventType"] !== "AwsApiCall" ||
+    event["errorCode"] ||
+    event["errorMessage"] ||
+    event["recipientAccountId"] !== account ||
+    event["awsRegion"] !== lease.region ||
+    typeof event["eventID"] !== "string" ||
+    !/^[a-f0-9-]{36}$/.test(event["eventID"]) ||
+    summary["EventId"] !== event["eventID"] ||
+    summary["EventSource"] !== event["eventSource"] ||
     !Number.isFinite(eventTime) ||
     eventTime < start ||
     eventTime > end ||
     !Array.isArray(instances) ||
     instances.length !== 1 ||
-    record(instances[0]).instanceId !== lease.cloudID ||
-    request.keyName !== lease.providerKey ||
+    record(instances[0])["instanceId"] !== lease.cloudID ||
+    request["keyName"] !== lease.providerKey ||
     !Array.isArray(specifications)
   )
     invalidEvidence();
   const instanceSpecifications = specifications
     .map(record)
-    .filter((item) => item.resourceType === "instance");
+    .filter((item) => item["resourceType"] === "instance");
   if (instanceSpecifications.length !== 1) invalidEvidence();
-  const tags = instanceSpecifications[0]!.tags;
+  const tags = instanceSpecifications[0]!["tags"];
   if (!Array.isArray(tags) || tags.length > 100) invalidEvidence();
   const labels: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const value of tags) {
     const tag = record(value);
     if (
-      typeof tag.key !== "string" ||
-      typeof tag.value !== "string" ||
-      Object.hasOwn(labels, tag.key)
+      typeof tag["key"] !== "string" ||
+      typeof tag["value"] !== "string" ||
+      Object.hasOwn(labels, tag["key"])
     )
       invalidEvidence();
-    labels[tag.key] = tag.value;
+    labels[tag["key"]] = tag["value"];
   }
   if (
     !providerLabelsOwnedByLease(labels, lease, "aws") ||
-    labels.provider_key !== lease.providerKey
+    labels["provider_key"] !== lease.providerKey
   )
     invalidEvidence();
   return {
     region: lease.region!,
     providerScope: `aws:account:${account}`,
-    eventID: event.eventID,
+    eventID: event["eventID"],
     eventTime: new Date(eventTime).toISOString(),
   };
 }

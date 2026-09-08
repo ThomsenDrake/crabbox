@@ -7509,7 +7509,7 @@ export class FleetCoordinator {
           : undefined;
       if (!provider?.recoverCleanup)
         return json({ error: "cleanup_recovery_unsupported" }, { status: 501 });
-      if (provider.cleanupRecoveryAdminOnly && !admin) {
+      if (provider.supportsCleanupScopeRecovery && !admin) {
         return json(
           { error: "forbidden", message: "administrator cleanup recovery required" },
           { status: 403 },
@@ -7522,6 +7522,16 @@ export class FleetCoordinator {
         return json({ error: "cleanup_recovery_requires_expired_blocked_lease" }, { status: 409 });
       }
       const expectedBinding = this.cleanupRecoveryLeaseBinding(lease);
+      const commitScopeRecovery: ProviderScopeRecoveryCommit = (observation, persistAudit) =>
+        this.commitRecoveredLeaseScope(
+          request,
+          lease.id,
+          expectedBinding,
+          observation,
+          persistAudit,
+        );
+      const scopeRecoveryArgs: [] | [ProviderScopeRecoveryCommit] =
+        provider.supportsCleanupScopeRecovery ? [commitScopeRecovery] : [];
       try {
         const recovery = await provider.recoverCleanup(
           lease,
@@ -7541,14 +7551,7 @@ export class FleetCoordinator {
               }
               return await commit();
             }),
-          (observation, persistAudit) =>
-            this.commitRecoveredLeaseScope(
-              request,
-              lease.id,
-              expectedBinding,
-              observation,
-              persistAudit,
-            ),
+          ...scopeRecoveryArgs,
         );
         return json({ leaseID: lease.id, provider: providerID, recovery });
       } catch (error) {
@@ -7582,7 +7585,7 @@ export class FleetCoordinator {
       if (!provider?.inspectCleanup) {
         return json({ error: "cleanup_inspection_unsupported" }, { status: 501 });
       }
-      if (provider.cleanupRecoveryAdminOnly && !admin) {
+      if (provider.supportsCleanupScopeRecovery && !admin) {
         return json(
           { error: "forbidden", message: "administrator cleanup inspection required" },
           { status: 403 },
@@ -26723,7 +26726,8 @@ interface CloudProvider {
   deleteServer(id: string): Promise<void>;
   deleteOwnedServer?(lease: LeaseRecord): Promise<void>;
   inspectCleanup?(lease: LeaseRecord): Promise<unknown>;
-  cleanupRecoveryAdminOnly?: true;
+  // Scope repair requires admin authorization and its own lifecycle commit capability.
+  supportsCleanupScopeRecovery?: true;
   // Revalidate the lease after provider reads, before committing any recovery writes.
   recoverCleanup?(
     lease: LeaseRecord,
@@ -28378,7 +28382,7 @@ type AWSLeaseOperationSession = Parameters<Parameters<EC2SpotClient["withLeaseOp
 
 export class AWSProvider implements CloudProvider {
   readonly recoveryIsAuthoritative = true;
-  readonly cleanupRecoveryAdminOnly = true;
+  readonly supportsCleanupScopeRecovery = true;
 
   private clientValue?: EC2SpotClient;
   private readonly region: string;

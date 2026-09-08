@@ -18,7 +18,7 @@ const region = "eu-west-1";
 const headers = {
   "content-type": "application/json",
   "x-crabbox-owner": "alice@example.com",
-  "x-crabbox-org": orgKeyForLabel("example-org"),
+  "x-crabbox-org": "example-org",
   "x-crabbox-admin": "true",
 };
 
@@ -162,7 +162,9 @@ it("persists atomic AWS scope recovery across real PostgreSQL reopen beside a sc
     await expect(replay.json()).resolves.toMatchObject({ recovery });
 
     // An ordinary account-bound lease still uses normal release; it needs no legacy repair audit.
-    const released = await resumed.fleet.fetch(request(ordinary.id, "release", { delete: true }));
+    const ownerRelease = request(ordinary.id, "release", { delete: true });
+    ownerRelease.headers.delete("x-crabbox-admin");
+    const released = await resumed.fleet.fetch(ownerRelease);
     expect(released.status).toBe(200);
     await vi.waitFor(
       async () => {

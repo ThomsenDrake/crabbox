@@ -220,6 +220,16 @@ type JSONListBackend interface {
 }
 ```
 
+For Doctor aggregates, use `core.DoctorChecksStatus(checks)`: after trimming and
+lowercasing statuses, literal `failed` or `missing` yields `failed`; otherwise
+`warning` yields `warning`, and all other values (including empty, unknown, and
+`skip`) are nonfailures. Nil or empty checks yield `ok`. The helper preserves
+the input checks and their detail maps. Map severity to provider-local vocabulary
+locally, as Sealos Devbox does with `failed` → `blocked` and everything else →
+`ready`, using that same mapped status in its summary. The CLI continues to
+render and classify nonempty `Checks` in preference to aggregate `Status` and
+`Message`; consolidating internal aggregates does not change that precedence.
+
 `FeatureRunSession` is also an explicit capability contract. Delegated
 providers return their handle in `RunResult`; opted-in SSH providers such as AWS
 and `local-container` rely on core to write the handle after exact claim and
@@ -614,11 +624,12 @@ provider spec and the non-brokered implementation. Brokered list/pool still
 enforces the existing admin-token requirement; the wrapper must not silently
 downgrade brokered pool/list to a direct provider listing.
 
-Only `hetzner`, `aws`, `azure`, `daytona`, and `gcp` declare `Coordinator: supported`; every
-other adapter is `Coordinator: never` and always runs direct-from-CLI. Even the
-five brokerable providers run direct unless a broker URL is configured
-(`CRABBOX_COORDINATOR` / `config set-broker`). Adding broker support to another
-provider means changing its spec and implementing Worker-side support.
+`hetzner`, `aws`, `azure`, `daytona`, `gcp`, and `koyeb` declare `Coordinator:
+supported`; every other adapter is `Coordinator: never` and always runs
+direct-from-CLI. The first five brokerable providers run direct unless a broker
+URL is configured (`CRABBOX_COORDINATOR` / `config set-broker`); Koyeb requires
+the coordinator. Adding broker support to another provider means changing its
+spec and implementing Worker-side support.
 
 ## Request And Result Types
 

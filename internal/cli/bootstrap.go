@@ -134,7 +134,7 @@ func windowsBootstrapHeaderPowerShell(cfg Config, publicKey, workRoot string) st
 	script := sharedWindowsHeader(cfg.SSHUser, publicKey, workRoot, sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts))
 	// An omitted mode retains the native default; WSL2 owns a separate Linux runtime.
 	if cfg.WindowsMode != windowsModeWSL2 {
-		script += sharedWindowsRuntime() + sharedWindowsRuntimeGate()
+		script += sharedWindowsRuntime() + sharedWindowsRuntimeGate() + sharedWindowsNodeInstall() + sharedWindowsDetachInstall()
 	}
 	return script
 }
@@ -180,11 +180,12 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	workRoot := windowsWSLWorkRoot(cfg)
 	headless := ""
 	if !cfg.Desktop && !cfg.Browser {
-		headless = windowsWSL2HeadlessConfigPowerShell
+		// WSLg can stall headless distro launches from Windows service sessions.
+		headless = `$managedWSLConfig = Set-CrabboxWSLConfigValue $managedWSLConfig 'wsl2' 'guiApplications=false'`
 	}
 	return `
 	$wslConfigChanged = $false
-` + headless + `
+` + strings.ReplaceAll(windowsWSL2ConfigPowerShell, "@HEADLESS_CONFIG@", headless) + `
 	$wslDistro = "Crabbox"
 	$wslRoot = "C:\ProgramData\crabbox\wsl\Crabbox"
 	$wslRootfs = "C:\ProgramData\crabbox\wsl\ubuntu-noble-wsl-amd64.rootfs.tar.gz"
@@ -220,7 +221,7 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	}
 	if ($wslConfigChanged) {
 	  wsl.exe --shutdown | Out-Host
-	  if ($LASTEXITCODE -ne 0) { throw "apply headless WSL configuration failed with exit $LASTEXITCODE" }
+	  if ($LASTEXITCODE -ne 0) { throw "apply managed WSL configuration failed with exit $LASTEXITCODE" }
 	}
 	wsl.exe --set-default-version 2 | Out-Host
 	if ($LASTEXITCODE -ne 0) { throw "wsl --set-default-version 2 failed with exit $LASTEXITCODE" }
@@ -278,22 +279,57 @@ Acquire::https::Timeout "30";
 APT
 rm -rf /var/lib/apt/lists/*
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git jq python3-minimal rsync
-` + sharedWslTruffleHogInstall() + `cat >/usr/local/bin/crabbox-ready <<'READY'
+apt-get install -y --no-install-recommends ca-certificates curl git jq python3 rsync sudo
+if ! id -u crabbox >/dev/null 2>&1; then
+  useradd --create-home --user-group --shell /bin/bash crabbox
+fi
+groupadd -f docker
+usermod --append --groups sudo,docker --shell /bin/bash crabbox
+test "$(id -u crabbox)" -ne 0
+install -d -m 0755 /etc/sudoers.d
+printf '%s\n' 'crabbox ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/crabbox
+chmod 0440 /etc/sudoers.d/crabbox
+visudo -cf /etc/sudoers.d/crabbox
+chown -R crabbox:crabbox ` + shellQuote(workRoot) + ` /var/cache/crabbox
+# All WSL transports inherit this identity, including staged helpers and rsync.
+# Preserve the distro's boot, automount, networking, and interop settings.
+python3 - <<'WSL_USER'
+import configparser
+from pathlib import Path
+path = Path('/etc/wsl.conf')
+config = configparser.ConfigParser(interpolation=None)
+config.optionxform = str
+config.read(path)
+if not config.has_section('user'):
+    config.add_section('user')
+config.set('user', 'default', 'crabbox')
+with path.open('w') as output:
+    config.write(output, space_around_delimiters=False)
+WSL_USER
+` + sharedLinuxNodeInstall() + sharedWslTruffleHogInstall() + `cat >/usr/local/bin/crabbox-ready <<'READY'
 #!/usr/bin/env bash
 set -euo pipefail
+test "$(id -u)" -ne 0
+test "$(id -un)" = crabbox
+test "$HOME" = /home/crabbox
+test -w "$HOME"
+sudo -n true
+test -w /var/cache/crabbox/npm
+test -w /var/cache/crabbox/pnpm
 git --version >/dev/null
 python3 --version >/dev/null
 rsync --version >/dev/null
 curl --version >/dev/null
 jq --version >/dev/null
 trufflehog --no-update --version >/dev/null
+node --version >/dev/null
+npm --version >/dev/null
 wslpath -w ` + shellQuote(workRoot) + ` >/dev/null
 test -w ` + shellQuote(workRoot) + `
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 touch /var/lib/crabbox/bootstrapped
-crabbox-ready
+sudo -H -u crabbox /usr/local/bin/crabbox-ready
 '@
 	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
 	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
@@ -301,46 +337,48 @@ crabbox-ready
 	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
 	wsl.exe --terminate $wslDistro | Out-Host
 	if ($LASTEXITCODE -ne 0) { throw "WSL restart failed with exit $LASTEXITCODE" }
-	wsl.exe -d $wslDistro --user root --exec /usr/local/bin/crabbox-ready
+	wsl.exe -d $wslDistro --exec /usr/local/bin/crabbox-ready
 	if ($LASTEXITCODE -ne 0) { throw "WSL cold-start readiness failed with exit $LASTEXITCODE" }
 	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
 	Restart-Service sshd -Force
 	`
 }
 
-// WSLg's RDP compositor is unnecessary for headless SSH leases and can crash
-// in Windows service sessions, leaving even non-GUI distro launches blocked.
-const windowsWSL2HeadlessConfigPowerShell = `
-function ConvertTo-CrabboxHeadlessWSLConfig([string]$Text) {
+// The lease owns distro lifetime: WSL's client-idle shutdown kills detached
+// daemons even while their Linux processes remain active. WSLg stays optional.
+const windowsWSL2ConfigPowerShell = `
+function Set-CrabboxWSLConfigValue([string]$Text, [string]$Section, [string]$Setting) {
   $result = [Collections.Generic.List[string]]::new()
-  $inWSL2 = $false
+  $inSection = $false
   $hasSection = $false
   $hasKey = $false
+  $keyPattern = '^\s*' + [Regex]::Escape(($Setting -split '=', 2)[0]) + '\s*='
   if ($Text.Length -gt 0) {
     foreach ($line in ($Text -split '\r?\n')) {
       if ($line -match '^\s*\[([^\]]+)\]\s*(?:[;#].*)?$') {
-        if ($inWSL2 -and -not $hasKey) { $result.Add('guiApplications=false') }
-        $inWSL2 = $Matches[1].Trim() -eq 'wsl2'
-        $hasSection = $hasSection -or $inWSL2
+        if ($inSection -and -not $hasKey) { $result.Add($Setting) }
+        $inSection = $Matches[1].Trim() -eq $Section
+        $hasSection = $hasSection -or $inSection
         $hasKey = $false
       }
-      if ($inWSL2 -and $line -match '^\s*guiApplications\s*=') {
-        $result.Add('guiApplications=false')
+      if ($inSection -and $line -match $keyPattern) {
+        $result.Add($Setting)
         $hasKey = $true
       } else { $result.Add($line) }
     }
   }
-  if (-not $hasSection) { $result.Add('[wsl2]'); $inWSL2 = $true; $hasKey = $false }
-  if ($inWSL2 -and -not $hasKey) { $result.Add('guiApplications=false') }
+  if (-not $hasSection) { $result.Add('[' + $Section + ']'); $inSection = $true; $hasKey = $false }
+  if ($inSection -and -not $hasKey) { $result.Add($Setting) }
   return $result -join [char]10
 }
 $wslConfigPath = Join-Path $HOME '.wslconfig'
 $wslConfig = ''
 if (Test-Path -LiteralPath $wslConfigPath) { $wslConfig = [IO.File]::ReadAllText($wslConfigPath) }
-$headlessWSLConfig = ConvertTo-CrabboxHeadlessWSLConfig $wslConfig
-$wslConfigChanged = $headlessWSLConfig -cne $wslConfig
+$managedWSLConfig = Set-CrabboxWSLConfigValue $wslConfig 'general' 'instanceIdleTimeout=-1'
+@HEADLESS_CONFIG@
+$wslConfigChanged = $managedWSLConfig -cne $wslConfig
 if ($wslConfigChanged) {
-  [IO.File]::WriteAllText($wslConfigPath, $headlessWSLConfig, [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($wslConfigPath, $managedWSLConfig, [Text.UTF8Encoding]::new($false))
 }
 `
 
@@ -425,7 +463,7 @@ func macOSUserData(cfg Config, publicKey string) string {
 	if workRoot == "" {
 		workRoot = defaultMacOSWorkRoot
 	}
-	return sharedMacOS(cfg.SSHUser, publicKey, workRoot, sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts))
+	return "#!/bin/bash\nset -euo pipefail\n(\n" + sharedMacOSSSHSession() + ")\n(\n" + sharedMacOSNodeInstall() + ")\n" + sharedMacOS(cfg.SSHUser, publicKey, workRoot, sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts))
 }
 
 func cloudInitOptionalReadyChecks(cfg Config) string {
@@ -816,6 +854,9 @@ func cloudInitWaylandDesktopWriteFiles(desktopEnv string) string {
 
 func cloudInitOptionalBootstrap(cfg Config) string {
 	var parts []string
+	if cfg.Desktop || cfg.Browser {
+		parts = append(parts, indentCloudInitRuncmd(sharedLinuxOptionalPackages()))
+	}
 	if cfg.Tailscale.Enabled {
 		parts = append(parts, cloudInitTailscaleBootstrap(cfg))
 	}
@@ -874,7 +915,7 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
 `)
 			themeConfigure = "    CRABBOX_DESKTOP_USER=crabbox /usr/local/bin/crabbox-configure-desktop-theme\n"
 		}
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends `+packages+`
+		parts = append(parts, `    crabbox_install_packages `+packages+`
     install -d -m 0750 -o crabbox -g crabbox /var/lib/crabbox
     if [ ! -s /var/lib/crabbox/vnc.password ]; then
       (umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)
@@ -907,7 +948,7 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
     systemctl enable crabbox-desktop.service crabbox-wayvnc.service
     systemctl restart crabbox-desktop.service crabbox-wayvnc.service`)
 	} else if cfg.Desktop {
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-tools xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux novnc websockify
+		parts = append(parts, `    crabbox_install_packages tigervnc-standalone-server tigervnc-tools xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux novnc websockify
     install -d -m 0750 -o crabbox -g crabbox /var/lib/crabbox
     if [ ! -s /var/lib/crabbox/vnc.password ]; then
       (umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)
@@ -928,9 +969,9 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
 		parts = append(parts, cloudInitGCPExpiryGuardBootstrap())
 	}
 	if cfg.Browser {
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends gnupg build-essential python3
-    browser_path=""
-    if [ "$(dpkg --print-architecture)" = "amd64" ]; then
+		parts = append(parts, `    crabbox_install_packages gnupg build-essential python3
+    browser_path="$(crabbox_existing_browser || true)"
+    if [ -z "$browser_path" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then
       install -d -m 0755 /etc/apt/keyrings
       google_key_tmp="$(mktemp -d /etc/apt/keyrings/google-linux.gpg.tmp.XXXXXX)"
       google_key_home="$google_key_tmp/gnupg"

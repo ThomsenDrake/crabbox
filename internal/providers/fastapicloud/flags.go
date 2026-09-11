@@ -2,9 +2,9 @@ package fastapicloud
 
 import (
 	"flag"
-	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 // RegisterFastAPICloudProviderFlags exposes only non-secret provider flags.
@@ -16,12 +16,9 @@ func RegisterFastAPICloudProviderFlags(fs *flag.FlagSet, defaults Config) any {
 }
 
 func ApplyFastAPICloudProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
-	if isFastAPICloudProviderName(cfg.Provider) {
-		if flagWasSet(fs, "class") {
-			return exit(2, "--class is not supported for provider=%s", providerName)
-		}
-		if flagWasSet(fs, "type") {
-			return exit(2, "--type is not supported for provider=%s", providerName)
+	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
+		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "", ""); err != nil {
+			return err
 		}
 	}
 	v, ok := values.(core.FastAPICloudConfigFlagValues)
@@ -30,13 +27,4 @@ func ApplyFastAPICloudProviderFlags(cfg *Config, fs *flag.FlagSet, values any) e
 	}
 	v.Apply(&cfg.FastAPICloud, fs)
 	return nil
-}
-
-func isFastAPICloudProviderName(provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case providerName, "fastapicloud", "fastapi":
-		return true
-	default:
-		return false
-	}
 }

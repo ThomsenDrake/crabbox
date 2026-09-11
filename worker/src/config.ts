@@ -135,7 +135,8 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     provider !== "aws" &&
     provider !== "azure" &&
     provider !== "gcp" &&
-    provider !== "daytona"
+    provider !== "daytona" &&
+    provider !== "koyeb"
   ) {
     throw new Error(`unsupported provider: ${String(provider)}`);
   }
@@ -179,7 +180,8 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
       provider === "hetzner" ||
       provider === "azure" ||
       provider === "gcp" ||
-      provider === "daytona"
+      provider === "daytona" ||
+      provider === "koyeb"
     ) {
       throw new Error(unsupportedManagedTargetMessage(provider, target));
     }
@@ -218,6 +220,16 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
       "brokered provider=daytona takes CPU, memory, and disk from the configured Daytona snapshot",
     );
   }
+  if (provider === "koyeb") {
+    if (input.serverTypeExplicit) {
+      throw new Error(
+        "brokered provider=koyeb takes CPU and memory from the coordinator Koyeb instance configuration",
+      );
+    }
+    if (input.tailscaleExitNode?.trim()) {
+      throw new Error("brokered provider=koyeb does not support a Tailscale exit node");
+    }
+  }
   if (
     provider === "azure" &&
     target === "windows" &&
@@ -249,8 +261,10 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
   const azureSnapshot = input.azureSnapshot ?? "";
   const serverTypeAzureOSDisk = azureSnapshot ? "managed" : azureOSDisk;
   const serverType =
-    provider === "daytona"
-      ? "snapshot"
+    provider === "daytona" || provider === "koyeb"
+      ? provider === "daytona"
+        ? "snapshot"
+        : "large"
       : (input.serverType ??
         serverTypeForConfig(
           provider,
@@ -260,7 +274,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
           architecture,
           serverTypeAzureOSDisk,
         ));
-  if (input.serverType && provider !== "daytona") {
+  if (input.serverType && provider !== "daytona" && provider !== "koyeb") {
     validateArchitectureServerType(
       provider,
       target,
@@ -323,7 +337,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     browser: input.browser ?? false,
     imageRequirements: normalizeImageRequirements(input.imageRequirements),
     code: input.code ?? false,
-    tailscale: input.tailscale ?? false,
+    tailscale: provider === "koyeb" ? (input.tailscale ?? true) : (input.tailscale ?? false),
     tailscaleTags: normalizeTailscaleTags(input.tailscaleTags ?? ["tag:crabbox"]),
     tailscaleHostname: input.tailscaleHostname ?? "",
     tailscaleAuthKey: "",
@@ -380,13 +394,18 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     capacityAvailabilityZones: input.capacity?.availabilityZones ?? [],
     capacityHints: input.capacity?.hints ?? true,
     sshUser,
-    sshPort: provider === "daytona" ? "22" : (input.sshPort ?? "2222"),
-    sshFallbackPorts: provider === "daytona" ? [] : validPorts(input.sshFallbackPorts ?? ["22"]),
+    sshPort: provider === "daytona" || provider === "koyeb" ? "22" : (input.sshPort ?? "2222"),
+    sshFallbackPorts:
+      provider === "daytona" || provider === "koyeb"
+        ? []
+        : validPorts(input.sshFallbackPorts ?? ["22"]),
     providerKey: input.providerKey?.trim() ?? "",
     workRoot:
       input.workRoot ??
-      (provider === "daytona"
-        ? "/home/daytona/crabbox"
+      (provider === "daytona" || provider === "koyeb"
+        ? provider === "daytona"
+          ? "/home/daytona/crabbox"
+          : "/workspace/crabbox"
         : defaultWorkRoot(target, windowsMode, sshUser)),
     ttlSeconds,
     idleTimeoutSeconds,
@@ -811,22 +830,6 @@ export function serverTypeForClass(machineClass: string): string {
   return serverTypeCandidatesForClass(machineClass)[0] ?? machineClass;
 }
 
-export function serverTypeForProviderClass(provider: Provider, machineClass: string): string {
-  if (provider === "daytona") {
-    return "snapshot";
-  }
-  if (provider === "aws") {
-    return awsInstanceTypeCandidatesForClass(machineClass)[0] ?? machineClass;
-  }
-  if (provider === "azure") {
-    return azureVMSizeCandidatesForClass(machineClass)[0] ?? machineClass;
-  }
-  if (provider === "gcp") {
-    return gcpMachineTypeCandidatesForClass(machineClass)[0] ?? machineClass;
-  }
-  return serverTypeForClass(machineClass);
-}
-
 export function serverTypeForConfig(
   provider: Provider,
   target: TargetOS,
@@ -837,6 +840,9 @@ export function serverTypeForConfig(
 ): string {
   if (provider === "daytona") {
     return "snapshot";
+  }
+  if (provider === "koyeb") {
+    return "large";
   }
   if (provider === "aws") {
     return (
@@ -861,42 +867,40 @@ export function serverTypeForConfig(
   return serverTypeForClass(machineClass);
 }
 
-export function gcpMachineTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "tiny":
-      return ["c4-standard-4", "c3-standard-4", "n2-standard-4", "n2d-standard-4"];
-    case "small":
-      return ["c4-standard-8", "c3-standard-8", "n2-standard-8", "n2d-standard-8", "c4-standard-4"];
-    case "standard":
-      return ["c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"];
-    case "fast":
-      return [
-        "c4-standard-64",
-        "c3-standard-44",
-        "n2-standard-64",
-        "n2d-standard-64",
-        "c4-standard-32",
-      ];
-    case "large":
-      return [
-        "c4-standard-96",
-        "c3-standard-88",
-        "n2-standard-80",
-        "n2d-standard-96",
-        "c4-standard-64",
-      ];
-    case "beast":
-      return [
-        "c4-standard-192",
-        "c4-standard-96",
-        "c3-standard-176",
-        "c3-standard-88",
-        "n2d-standard-224",
-        "n2-standard-128",
-      ];
-    default:
-      return [machineClass];
+function candidatesForClass(
+  table: Readonly<Record<string, readonly string[]>>,
+  machineClass: string,
+): string[] {
+  if (typeof machineClass !== "string" || !Object.hasOwn(table, machineClass)) {
+    return [machineClass];
   }
+  return [...(table[machineClass] ?? [])];
+}
+
+const gcpMachineTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["c4-standard-4", "c3-standard-4", "n2-standard-4", "n2d-standard-4"],
+  small: ["c4-standard-8", "c3-standard-8", "n2-standard-8", "n2d-standard-8", "c4-standard-4"],
+  standard: ["c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"],
+  fast: ["c4-standard-64", "c3-standard-44", "n2-standard-64", "n2d-standard-64", "c4-standard-32"],
+  large: [
+    "c4-standard-96",
+    "c3-standard-88",
+    "n2-standard-80",
+    "n2d-standard-96",
+    "c4-standard-64",
+  ],
+  beast: [
+    "c4-standard-192",
+    "c4-standard-96",
+    "c3-standard-176",
+    "c3-standard-88",
+    "n2d-standard-224",
+    "n2-standard-128",
+  ],
+};
+
+export function gcpMachineTypeCandidatesForClass(machineClass: string): string[] {
+  return candidatesForClass(gcpMachineTypeCandidates, machineClass);
 }
 
 export function azureVMSizeCandidatesForTargetClass(
@@ -929,6 +933,72 @@ export function azureVMSizeCandidatesForClass(machineClass: string): string[] {
   return azureVMSizeCandidatesForArchitectureClass("amd64", machineClass);
 }
 
+const azureVMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_F2s_v2",
+  ],
+  small: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_F8s_v2",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D4ads_v6",
+    "Standard_D4ds_v6",
+    "Standard_F4s_v2",
+  ],
+  standard: [
+    "Standard_D32ads_v6",
+    "Standard_D32ds_v6",
+    "Standard_F32s_v2",
+    "Standard_D32ads_v5",
+    "Standard_D32ds_v5",
+    "Standard_D16ads_v6",
+    "Standard_D16ds_v6",
+    "Standard_F16s_v2",
+  ],
+  fast: [
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+    "Standard_D64ads_v5",
+    "Standard_D64ds_v5",
+    "Standard_D48ads_v6",
+    "Standard_D48ds_v6",
+    "Standard_F48s_v2",
+    "Standard_D32ads_v6",
+    "Standard_D32ds_v6",
+    "Standard_F32s_v2",
+  ],
+  large: [
+    "Standard_D96ads_v6",
+    "Standard_D96ds_v6",
+    "Standard_D96ads_v5",
+    "Standard_D96ds_v5",
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+    "Standard_D48ads_v6",
+    "Standard_D48ds_v6",
+    "Standard_F48s_v2",
+  ],
+  beast: [
+    "Standard_D192ds_v6",
+    "Standard_D128ds_v6",
+    "Standard_D96ads_v6",
+    "Standard_D96ds_v6",
+    "Standard_D96ads_v5",
+    "Standard_D96ds_v5",
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+  ],
+};
+
 export function azureVMSizeCandidatesForArchitectureClass(
   architecture: Architecture,
   machineClass: string,
@@ -936,112 +1006,34 @@ export function azureVMSizeCandidatesForArchitectureClass(
   if (architecture === "arm64") {
     return azureARM64VMSizeCandidatesForClass(machineClass);
   }
-  switch (machineClass) {
-    case "tiny":
-      return [
-        "Standard_D2ads_v6",
-        "Standard_D2ds_v6",
-        "Standard_D2ads_v5",
-        "Standard_D2ds_v5",
-        "Standard_F2s_v2",
-      ];
-    case "small":
-      return [
-        "Standard_D8ads_v6",
-        "Standard_D8ds_v6",
-        "Standard_F8s_v2",
-        "Standard_D8ads_v5",
-        "Standard_D8ds_v5",
-        "Standard_D4ads_v6",
-        "Standard_D4ds_v6",
-        "Standard_F4s_v2",
-      ];
-    case "standard":
-      return [
-        "Standard_D32ads_v6",
-        "Standard_D32ds_v6",
-        "Standard_F32s_v2",
-        "Standard_D32ads_v5",
-        "Standard_D32ds_v5",
-        "Standard_D16ads_v6",
-        "Standard_D16ds_v6",
-        "Standard_F16s_v2",
-      ];
-    case "fast":
-      return [
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-        "Standard_D64ads_v5",
-        "Standard_D64ds_v5",
-        "Standard_D48ads_v6",
-        "Standard_D48ds_v6",
-        "Standard_F48s_v2",
-        "Standard_D32ads_v6",
-        "Standard_D32ds_v6",
-        "Standard_F32s_v2",
-      ];
-    case "large":
-      return [
-        "Standard_D96ads_v6",
-        "Standard_D96ds_v6",
-        "Standard_D96ads_v5",
-        "Standard_D96ds_v5",
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-        "Standard_D48ads_v6",
-        "Standard_D48ds_v6",
-        "Standard_F48s_v2",
-      ];
-    case "beast":
-      return [
-        "Standard_D192ds_v6",
-        "Standard_D128ds_v6",
-        "Standard_D96ads_v6",
-        "Standard_D96ds_v6",
-        "Standard_D96ads_v5",
-        "Standard_D96ds_v5",
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureVMSizeCandidates, machineClass);
 }
 
+const azureARM64VMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["Standard_D2pds_v6", "Standard_D2ps_v6"],
+  small: ["Standard_D8pds_v6", "Standard_D8ps_v6", "Standard_D4pds_v6", "Standard_D4ps_v6"],
+  standard: ["Standard_D32pds_v6", "Standard_D32ps_v6", "Standard_D16pds_v6", "Standard_D16ps_v6"],
+  fast: [
+    "Standard_D64pds_v6",
+    "Standard_D64ps_v6",
+    "Standard_D48pds_v6",
+    "Standard_D48ps_v6",
+    "Standard_D32pds_v6",
+    "Standard_D32ps_v6",
+  ],
+  large: [
+    "Standard_D96pds_v6",
+    "Standard_D96ps_v6",
+    "Standard_D64pds_v6",
+    "Standard_D64ps_v6",
+    "Standard_D48pds_v6",
+    "Standard_D48ps_v6",
+  ],
+  beast: ["Standard_D96pds_v6", "Standard_D96ps_v6", "Standard_D64pds_v6", "Standard_D64ps_v6"],
+};
+
 export function azureARM64VMSizeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "tiny":
-      return ["Standard_D2pds_v6", "Standard_D2ps_v6"];
-    case "small":
-      return ["Standard_D8pds_v6", "Standard_D8ps_v6", "Standard_D4pds_v6", "Standard_D4ps_v6"];
-    case "standard":
-      return ["Standard_D32pds_v6", "Standard_D32ps_v6", "Standard_D16pds_v6", "Standard_D16ps_v6"];
-    case "fast":
-      return [
-        "Standard_D64pds_v6",
-        "Standard_D64ps_v6",
-        "Standard_D48pds_v6",
-        "Standard_D48ps_v6",
-        "Standard_D32pds_v6",
-        "Standard_D32ps_v6",
-      ];
-    case "large":
-      return [
-        "Standard_D96pds_v6",
-        "Standard_D96ps_v6",
-        "Standard_D64pds_v6",
-        "Standard_D64ps_v6",
-        "Standard_D48pds_v6",
-        "Standard_D48ps_v6",
-      ];
-    case "beast":
-      return ["Standard_D96pds_v6", "Standard_D96ps_v6", "Standard_D64pds_v6", "Standard_D64ps_v6"];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureARM64VMSizeCandidates, machineClass);
 }
 
 export function azureVMSizeIsARM64(vmSize: string): boolean {
@@ -1105,59 +1097,53 @@ function azureEphemeralFullCachingCandidates(
   return candidates;
 }
 
+const azureWindowsVMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_D2as_v6",
+  ],
+  small: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D8as_v6",
+  ],
+  standard: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_D2as_v6",
+  ],
+  fast: [
+    "Standard_D4ads_v6",
+    "Standard_D4ds_v6",
+    "Standard_D4ads_v5",
+    "Standard_D4ds_v5",
+    "Standard_D4as_v6",
+  ],
+  large: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D8as_v6",
+  ],
+  beast: [
+    "Standard_D16ads_v6",
+    "Standard_D16ds_v6",
+    "Standard_D16ads_v5",
+    "Standard_D16ds_v5",
+    "Standard_D8ads_v6",
+  ],
+};
+
 export function azureWindowsVMSizeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "tiny":
-      return [
-        "Standard_D2ads_v6",
-        "Standard_D2ds_v6",
-        "Standard_D2ads_v5",
-        "Standard_D2ds_v5",
-        "Standard_D2as_v6",
-      ];
-    case "small":
-      return [
-        "Standard_D8ads_v6",
-        "Standard_D8ds_v6",
-        "Standard_D8ads_v5",
-        "Standard_D8ds_v5",
-        "Standard_D8as_v6",
-      ];
-    case "standard":
-      return [
-        "Standard_D2ads_v6",
-        "Standard_D2ds_v6",
-        "Standard_D2ads_v5",
-        "Standard_D2ds_v5",
-        "Standard_D2as_v6",
-      ];
-    case "fast":
-      return [
-        "Standard_D4ads_v6",
-        "Standard_D4ds_v6",
-        "Standard_D4ads_v5",
-        "Standard_D4ds_v5",
-        "Standard_D4as_v6",
-      ];
-    case "large":
-      return [
-        "Standard_D8ads_v6",
-        "Standard_D8ds_v6",
-        "Standard_D8ads_v5",
-        "Standard_D8ds_v5",
-        "Standard_D8as_v6",
-      ];
-    case "beast":
-      return [
-        "Standard_D16ads_v6",
-        "Standard_D16ds_v6",
-        "Standard_D16ads_v5",
-        "Standard_D16ds_v5",
-        "Standard_D8ads_v6",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureWindowsVMSizeCandidates, machineClass);
 }
 
 export function awsInstanceTypeCandidatesForTargetClass(
@@ -1252,28 +1238,60 @@ function providerClassLiteralCandidates(machineClass: string): string[] {
   return isCanonicalProviderClass(machineClass) ? [] : [machineClass];
 }
 
+const serverTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["ccx13", "cpx22", "cx23"],
+  small: ["ccx23", "cpx32", "cx33"],
+  standard: ["ccx33", "cpx62", "cx53"],
+  fast: ["ccx43", "cpx62", "cx53"],
+  large: ["ccx53", "ccx43", "cpx62", "cx53"],
+  beast: ["ccx63", "ccx53", "ccx43", "cpx62", "cx53"],
+};
+
 export function serverTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "tiny":
-      return ["ccx13", "cpx22", "cx23"];
-    case "small":
-      return ["ccx23", "cpx32", "cx33"];
-    case "standard":
-      return ["ccx33", "cpx62", "cx53"];
-    case "fast":
-      return ["ccx43", "cpx62", "cx53"];
-    case "large":
-      return ["ccx53", "ccx43", "cpx62", "cx53"];
-    case "beast":
-      return ["ccx63", "ccx53", "ccx43", "cpx62", "cx53"];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(serverTypeCandidates, machineClass);
 }
 
 export function awsInstanceTypeCandidatesForClass(machineClass: string): string[] {
   return awsInstanceTypeCandidatesForArchitectureClass("amd64", machineClass);
 }
+
+const awsInstanceTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["m7a.large", "m7i.large", "c7a.xlarge", "c7i.xlarge", "t3.small"],
+  small: ["c7a.2xlarge", "c7i.2xlarge", "m7a.xlarge", "m7i.xlarge", "c7a.xlarge", "t3.small"],
+  standard: ["c7a.8xlarge", "c7i.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "c7a.4xlarge", "t3.small"],
+  fast: [
+    "c7a.16xlarge",
+    "c7i.16xlarge",
+    "m7a.16xlarge",
+    "m7i.16xlarge",
+    "c7a.12xlarge",
+    "c7a.8xlarge",
+    "t3.small",
+  ],
+  large: [
+    "c7a.24xlarge",
+    "c7i.24xlarge",
+    "m7a.24xlarge",
+    "m7i.24xlarge",
+    "r7a.24xlarge",
+    "c7a.16xlarge",
+    "c7a.12xlarge",
+    "t3.small",
+  ],
+  beast: [
+    "c7a.48xlarge",
+    "c7i.48xlarge",
+    "m7a.48xlarge",
+    "m7i.48xlarge",
+    "r7a.48xlarge",
+    "c7a.32xlarge",
+    "c7i.32xlarge",
+    "m7a.32xlarge",
+    "c7a.24xlarge",
+    "c7a.16xlarge",
+    "t3.small",
+  ],
+};
 
 export function awsInstanceTypeCandidatesForArchitectureClass(
   architecture: Architecture,
@@ -1282,84 +1300,27 @@ export function awsInstanceTypeCandidatesForArchitectureClass(
   if (architecture === "arm64") {
     return awsARM64InstanceTypeCandidatesForClass(machineClass);
   }
-  switch (machineClass) {
-    case "tiny":
-      return ["m7a.large", "m7i.large", "c7a.xlarge", "c7i.xlarge", "t3.small"];
-    case "small":
-      return ["c7a.2xlarge", "c7i.2xlarge", "m7a.xlarge", "m7i.xlarge", "c7a.xlarge", "t3.small"];
-    case "standard":
-      return [
-        "c7a.8xlarge",
-        "c7i.8xlarge",
-        "m7a.8xlarge",
-        "m7i.8xlarge",
-        "c7a.4xlarge",
-        "t3.small",
-      ];
-    case "fast":
-      return [
-        "c7a.16xlarge",
-        "c7i.16xlarge",
-        "m7a.16xlarge",
-        "m7i.16xlarge",
-        "c7a.12xlarge",
-        "c7a.8xlarge",
-        "t3.small",
-      ];
-    case "large":
-      return [
-        "c7a.24xlarge",
-        "c7i.24xlarge",
-        "m7a.24xlarge",
-        "m7i.24xlarge",
-        "r7a.24xlarge",
-        "c7a.16xlarge",
-        "c7a.12xlarge",
-        "t3.small",
-      ];
-    case "beast":
-      return [
-        "c7a.48xlarge",
-        "c7i.48xlarge",
-        "m7a.48xlarge",
-        "m7i.48xlarge",
-        "r7a.48xlarge",
-        "c7a.32xlarge",
-        "c7i.32xlarge",
-        "m7a.32xlarge",
-        "c7a.24xlarge",
-        "c7a.16xlarge",
-        "t3.small",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(awsInstanceTypeCandidates, machineClass);
 }
 
+const awsARM64InstanceTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["m7g.large", "c7g.xlarge", "r7g.large", "t4g.small"],
+  small: ["c7g.2xlarge", "m7g.xlarge", "r7g.large", "c7g.xlarge", "t4g.small"],
+  standard: ["c7g.8xlarge", "m7g.8xlarge", "r7g.8xlarge", "c7g.4xlarge", "t4g.small"],
+  fast: [
+    "c7g.16xlarge",
+    "m7g.16xlarge",
+    "r7g.16xlarge",
+    "c7g.12xlarge",
+    "c7g.8xlarge",
+    "t4g.small",
+  ],
+  large: ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"],
+  beast: ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"],
+};
+
 export function awsARM64InstanceTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "tiny":
-      return ["m7g.large", "c7g.xlarge", "r7g.large", "t4g.small"];
-    case "small":
-      return ["c7g.2xlarge", "m7g.xlarge", "r7g.large", "c7g.xlarge", "t4g.small"];
-    case "standard":
-      return ["c7g.8xlarge", "m7g.8xlarge", "r7g.8xlarge", "c7g.4xlarge", "t4g.small"];
-    case "fast":
-      return [
-        "c7g.16xlarge",
-        "m7g.16xlarge",
-        "r7g.16xlarge",
-        "c7g.12xlarge",
-        "c7g.8xlarge",
-        "t4g.small",
-      ];
-    case "large":
-      return ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"];
-    case "beast":
-      return ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(awsARM64InstanceTypeCandidates, machineClass);
 }
 
 export function awsInstanceTypeIsARM64(instanceType: string): boolean {

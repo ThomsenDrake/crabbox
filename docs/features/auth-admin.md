@@ -16,7 +16,7 @@ privilege levels:
 | **Admin token** | `config set-broker --admin-token-stdin` or `CRABBOX_COORDINATOR_ADMIN_TOKEN` | Fleet-wide admin routes |
 
 The broker only authorizes brokered providers (`aws`, `azure`, `daytona`, `gcp`,
-`hetzner`); all other providers run direct from the CLI and never see these
+`hetzner`, `koyeb`); all other providers run direct from the CLI and never see these
 tokens. For the route and Cloudflare Access model, see
 [Broker Auth And Routing](broker-auth-routing.md).
 
@@ -27,7 +27,12 @@ exchanges the OAuth code, then verifies the user is an **active member of an
 allowed GitHub org** (`CRABBOX_GITHUB_ALLOWED_ORGS`, or the singular
 `CRABBOX_GITHUB_ALLOWED_ORG`) and, if any **allowed teams** are configured
 (`CRABBOX_GITHUB_ALLOWED_TEAMS` / `CRABBOX_GITHUB_ALLOWED_TEAM`), a member of one
-of them. The account must also expose a verified email through GitHub's
+of them. The optional `CRABBOX_GITHUB_ALLOWED_OWNERS` setting narrows admission
+to a comma-separated list of exact `github:<positive-numeric-id>` principals.
+An unset or blank owner list preserves org/team-only admission. Once configured,
+only a listed owner can complete OAuth or reuse an existing signed user or portal
+token; changes take effect before the positive membership cache is consulted.
+The account must also expose a verified email through GitHub's
 `user:email` scope as an eligibility check; ownership uses GitHub's immutable
 numeric account ID, never an email or login. On success the broker issues a
 signed user token (prefix `cbxu_`, HMAC-SHA256, default 180-day expiry) for CLI
@@ -42,9 +47,12 @@ confirm identity or membership. Legacy email-owned sessions are rejected, so
 users must log in again after upgrading the broker with this security fix.
 
 Set `CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS` to tune the positive cache from 0
-to 3600 seconds. `CRABBOX_GITHUB_REVOKED_USERS` immediately denies listed
-immutable `github:<numeric-id>` owners; an optional `owner:` prefix is accepted.
-An email, login, or other invalid selector makes GitHub login and existing
+to 3600 seconds. Every `CRABBOX_GITHUB_ALLOWED_OWNERS` entry must be the canonical
+lowercase `github:<positive-numeric-id>` form; aliases, mutable emails/logins,
+unsafe numeric IDs, and empty list entries fail GitHub auth closed.
+`CRABBOX_GITHUB_REVOKED_USERS` immediately denies listed immutable
+`github:<numeric-id>` owners; an optional `owner:` prefix is accepted. An email,
+login, or other invalid revocation selector also makes GitHub login and existing
 GitHub sessions fail closed until an operator replaces it. This prevents a
 renamed or reassigned mutable identity from silently escaping an old revocation.
 
@@ -54,7 +62,7 @@ crabbox login --url https://broker.example.com --no-browser   # print the URL; o
 crabbox login --url https://broker.example.com --provider aws # also set the default brokered provider
 ```
 
-`--provider` accepts `hetzner`, `aws`, `azure`, `daytona`, or `gcp`. With no `--url`,
+`--provider` accepts `hetzner`, `aws`, `azure`, `daytona`, `gcp`, or `koyeb`. With no `--url`,
 `login` reuses the broker URL already in config. After storing the token, the
 CLI calls `whoami` to confirm the credential works.
 
@@ -164,7 +172,7 @@ GET  /v1/runs and logs/events    own runs only
 GET  /v1/usage                   own usage only
 GET  /v1/capacity                self-owner admission aggregate across months/orgs
 GET  /v1/pool                    admin token only
-POST /v1/leases with hostId      admin token only
+POST /v1/leases with hostId      admin, or matching org-owned Mac allocation
 /v1/admin/*                      admin token only
 ```
 
@@ -182,8 +190,31 @@ an elevated owner limit.
 
 Provider host inventory is also capacity administration. Normal portal users
 see a Dedicated Host only when it backs an active lease already visible to
-them; unattached host inventory and explicit host-pinned lease creation require
-admin authentication.
+them; unattached host inventory remains admin-only. Pinning an unused AWS Mac
+Dedicated Host also permits authenticated members only when an exact coordinator
+allocation record matches that host, the requested region, and their current org
+identity. New admin allocations persist that org. Missing or ambiguous records,
+other-org records, and historical managed leases do not grant permission. Hosts
+allocated by older coordinators without a record remain admin-only; no claim or
+backfill command is added by this change.
+Other provider pins and other AWS resource selectors remain admin-only; existing
+checkpoint grants retain their exact host scope.
+
+Host permission never authorizes adopting an occupying lease. A create request
+fails with `host_in_use` while that host has a live or retained instance. Exact
+fixed-ID replay preserves its existing owner and intent checks. Kept leases
+remain visible to their owners and share recipients in ordinary CLI listing,
+even when released with the instance retained.
+
+Host reservation inspection and repair are admin-only, including the legacy
+Mac-host route: `GET` or `POST /v1/admin/hosts/<host-id>/reservation`
+(and `/v1/admin/mac-hosts/<host-id>/reservation`). Pass `region` and optionally
+`provider=aws&target=macos`. POST rejects live or potentially retained leases
+with `409 host_in_use` unless `force=true`; missing leases and safely ended
+associations can be cleared without force. The response includes safe summaries,
+not lease credentials. Neither operation changes EC2 resources or allocation
+ownership. Use `crabbox admin mac-hosts reservation <host-id>` to inspect and
+`crabbox admin mac-hosts clear <host-id> [--force]` to repair.
 
 ## Lease sharing
 

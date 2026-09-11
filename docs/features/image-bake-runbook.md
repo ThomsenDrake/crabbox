@@ -280,6 +280,7 @@ platform at a time from the protected default branch:
 gh workflow run devtools-image-publish.yml \
   --ref main \
   -f target=linux \
+  -f linux_os=ubuntu:24.04 \
   -f region=eu-west-1
 
 gh workflow run devtools-image-publish.yml \
@@ -293,6 +294,13 @@ gh workflow run devtools-image-publish.yml \
   -f region=eu-west-1 \
   -f macos_host=use-existing
 ```
+
+Linux publication defaults to `linux_os=ubuntu:26.04`; the example explicitly
+selects Ubuntu 24.04. The selector applies only to the Linux mint command and
+scopes its source, candidate, and promoted proof leases, promotion, and receipt
+rollback. Windows and macOS commands do not receive this Linux selector.
+Existing explicit image overrides still take precedence; requesting an OS does
+not prove the guest's actual OS or qualify the image.
 
 Use `macos_host=allocate` only when no suitable EC2 Mac Dedicated Host is
 available. Unmeasured publication uploads its complete mint logs and macOS
@@ -319,6 +327,17 @@ instead of hand-running the prep and image commands:
 scripts/mint-aws-devtools-image.sh --target linux
 scripts/mint-aws-devtools-image.sh --target windows
 ```
+
+For an explicit Ubuntu 24.04 Linux plan, use:
+
+```bash
+CRABBOX_OS=ubuntu:24.04 scripts/mint-aws-devtools-image.sh --target linux
+```
+
+The standalone wrapper leaves existing CLI/config selection unchanged when
+`CRABBOX_OS` is unset. When it is set for Linux, promotion and receipt rollback
+receive the same explicit `--os`; final proof still uses normal image selection
+without a candidate AMI override.
 
 The default is a no-spend plan that prints what it would do and stops. Add
 `--run` only when the selected AWS account, region, quotas, and image name are
@@ -363,7 +382,8 @@ scripts/mint-aws-devtools-image.sh \
 ### What the prep scripts install
 
 - **Linux** (`scripts/install-linux-developer-tools.sh`): common CLI/build
-  tooling, GitHub CLI, Node 24.19.0 on x86_64, corepack/pnpm, TruffleHog 3.95.9, Chrome or
+  tooling, GitHub CLI, Node 24.19.0, Go 1.27.0, and Bun 1.4.0 on x86_64,
+  corepack/pnpm, TruffleHog 3.95.9, Chrome or
   Chromium for browser lanes, desktop/VNC helpers, Docker Engine, Compose,
   buildx, and a small default Docker image set. TruffleHog archives are pinned
   to reviewed SHA-256 digests for amd64 and arm64. NodeSource, Docker, and
@@ -378,6 +398,10 @@ scripts/mint-aws-devtools-image.sh \
   `python3-venv`). The standalone generated readiness producer verifies every
   functional probe, including creating and checking a disposable pip-enabled
   virtual environment, before atomically emitting the strongest supported profile.
+- **Managed WSL2 distro bootstrap**: the Linux installer's `--node-only` entrypoint
+  provides the same Node/npm baseline (checksum-pinned Node 24.19.0 on amd64).
+  It skips image-only Docker, Go, browser/desktop setup, pnpm activation, and the
+  offline pnpm archives; see [AWS targets](../providers/aws.md#targets).
 - **Windows** (`scripts/install-windows-developer-tools.ps1`): common CLI/build
   tooling, GitHub CLI, Node 24, corepack/pnpm, TruffleHog 3.95.9, and Windows
   Server container support with Docker Engine. It deliberately avoids Docker
@@ -446,8 +470,10 @@ Public archives are retained under `/opt/crabbox/toolchain-archives`:
 | `pnpm-12.3.4.tgz` | pnpm 12.3.4 JavaScript wrapper |
 | `exe.linux-x64-12.3.4.tgz` | pnpm 12.3.4 native executable for glibc Linux x64 |
 | `go1.27.0.linux-amd64.tar.gz` | Complete Go 1.27.0 distribution |
+| `bun-v1.4.0-linux-x64-baseline.zip` | Original Bun 1.4.0 baseline Linux glibc ZIP |
+| `bun-v1.4.0-linux-x64.zip` | Original Bun 1.4.0 optimized Linux glibc ZIP |
 
-The SHA-256 Node/Go pins and SHA-512 pnpm pins live in the installer's
+The SHA-256 Node/Go/Bun pins and SHA-512 pnpm pins live in the installer's
 `toolchain_archive_spec`. Consumers must carry independently reviewed pins,
 copy archives into private staging, validate those exact bytes, and extract
 fresh trees. Do not authenticate a cached installation by running `--version`,
@@ -485,11 +511,12 @@ script is the bundled Linux builder. It forwards the existing
 `CRABBOX_LINUX_NODE_MAJOR` and `CRABBOX_LINUX_PNPM_VERSION` overrides to that
 builder and freezes the same Node-major declaration into each smoke. The smoke
 checks the guest's Debian package architecture, not the mint host's architecture.
-Only Node major 24 on guest `amd64` requires the Node/pnpm archives. Go has an
-independent Linux `amd64` contract, including when the Node major is overridden.
-ARM guests and custom prep scripts retain the existing normal-tool smoke;
-their success does not qualify the x86_64 archive recipe. Missing or corrupt
-archives cannot disable either required probe for the supported builder.
+Only Node major 24 on guest `amd64` requires the Node/pnpm archives. Go and Bun
+have independent Linux `amd64` contracts, including when the Node major is
+overridden. Bun additionally requires glibc. ARM guests and custom prep scripts
+retain the existing normal-tool smoke; their success does not qualify the
+x86_64 archive recipe. Missing or corrupt archives cannot disable any required
+probe for the supported builder.
 
 Go 1.27.0 installs at `/opt/hostedtoolcache/go/1.27.0/x64`, with image-owned
 `/usr/local/bin/go` and `gofmt` links. The installer authenticates a private
@@ -508,6 +535,46 @@ allowed. Files, directories and other targets require operator resolution
 before rebaking; a conflict preserves the existing tree, marker and aliases.
 Publication uses the same private temporary-symlink replacement as Node,
 without treating the pair as one atomic transaction.
+
+The bundled builder retains both Bun 1.4.0 x64 ZIPs on glibc Linux `amd64`,
+independently of the Node-major override. Their versioned cache filenames do
+not change the upstream ZIP bytes. After Node and Go setup, the baseline
+executable is installed at
+`/opt/crabbox/toolchains/bun/1.4.0/linux-x64-baseline/bun`, with a private
+`bunx -> bun` link beside it. `/usr/local/bin/bun` and
+`/usr/local/bin/bunx` are absolute links to those same-name backing paths. The
+baseline remains the generic image default even when the build guest supports
+AVX2 because a subsequent guest may have a different CPU. The optimized
+executable is run only when every visible CPU in that guest's `/proc/cpuinfo`
+exposes both AVX and AVX2. Absent or incomplete CPU evidence keeps baseline
+execution.
+
+Bun installation downloads the pinned original archive only on a cache miss.
+A present corrupt archive, symlink, malformed ZIP, or malformed cache root is a
+hard error, not permission to download a replacement. Each extraction uses a
+fresh private copy authenticated with its independently pinned SHA-256 first.
+Before modifying archives, the backing slot, or public aliases, installation
+accepts only absent public paths or exact current managed links, including
+dangling links. Operator files, directories, and other link targets fail with
+a conflict diagnostic and remain unchanged. The unpublished regular `bun` and
+relative public `bunx` layout is not migrated.
+
+Repeated installation rebuilds the exact image-owned slot from verified bytes,
+including an incomplete slot with absent public aliases. Symlinked directories
+in its path are rejected. New image directories and executables are mode 0755
+so nonroot users can traverse and execute them; no ownership changes are made.
+Neither the installed version nor a marker authenticates cached code. The
+aarch64 digest is retained only for pinned fallback compatibility. This producer
+does not install or qualify an ARM image, add musl/non-Linux routes, change
+custom prep scripts, or integrate a consumer-owned Bun cache.
+
+Each nonroot bundled-builder smoke checks normal-PATH `bun` and `bunx` after
+Node and Go setup, then authenticates and freshly extracts both ZIPs. Baseline,
+and optimized when the guest supports it, must execute local TypeScript, pass
+`bun test`, bundle the TypeScript, and execute the bundle. The proof uses a
+private home and dependency-free fixtures with auto-install disabled; `bunx`
+executes a local binary with `--no-install`. A missing cache fails this offline
+proof even though installation supports a pinned download fallback.
 
 Native GitHub runner registration seeds only `node/24.19.0/x64` and
 `go/1.27.0/x64` after configuration and before service start. It reads the
@@ -583,10 +650,27 @@ boots independently rerun the declared probes under a sanitized system PATH
 before skipping baseline APT. Use the timing logs to compare provider request,
 network readiness, bootstrap, and end-to-end time before and after each bake.
 
-Linux source, candidate, and promoted smokes require a nonroot user and execute
-the normal `pnpm --version` command in that user's existing environment, preserving
-its readiness check and first-use cache warming. This normal command is not
-used to authenticate cached archives or skip their verification.
+Linux source, candidate, and promoted smokes require a nonroot user. After
+successful bundled Linux preparation, the wrapper activates the selected pnpm
+release as the lease user: the privileged installer only seeds root's Corepack
+cache. The existing `CRABBOX_LINUX_PNPM_VERSION` selector is passed unchanged to
+Corepack, including tags, ranges, and integrity-qualified versions.
+
+Before image capture, the wrapper records the resolved ordinary `pnpm --version`
+outside the checkout, using the lease user's normal home/cache and disabling
+Corepack network access for the probe. It also requires `corepack pnpm --version`
+to agree, rejecting version disagreement from a shadowing command. Each later
+smoke checks that same resolved default offline without reactivating it or
+resolving the selector again.
+Preparation, capture, or version mismatch failures stop publication and follow
+the existing lease cleanup and promotion rollback paths.
+
+This establishes the image user's initial default, not a permanent version lock.
+Project `packageManager` pins and existing cached releases remain usable; no
+shared Corepack home is introduced. Custom prep scripts and Windows retain their
+existing behavior, and the standalone root installer does not configure arbitrary
+users. These normal-command checks do not authenticate cached archives or skip
+their verification.
 
 For the bundled Node-24/amd64 builder, each smoke additionally revalidates public
 archive bytes in private temporary directories. It executes fresh Node and both

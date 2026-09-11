@@ -2,6 +2,13 @@ import ssh2, { type Client as SSHClient, type ClientChannel } from "ssh2";
 
 import { AzureResumableProvisioning } from "./azure-provisioning";
 import {
+  clearHostReservations,
+  logClearedHostReservations,
+  publicHostReservation,
+  readHostReservations,
+  type HostScope,
+} from "./host-reservations";
+import {
   clearLeaseCleanupCompletion,
   completeLeaseProviderCleanup,
   leaseHasConfirmedNoProviderResource,
@@ -207,6 +214,12 @@ import {
   normalizeImageVariantSelectors,
 } from "./image-capabilities";
 import {
+  KoyebClient,
+  KoyebResumableProvisioning,
+  koyebConfigurationMissing,
+  koyebPrivateMeshAvailable,
+} from "./koyeb";
+import {
   MarketplaceInputError,
   marketplaceQuote,
   marketplaceStatus,
@@ -349,6 +362,7 @@ import {
   tailscaleTagOwnershipErrorMessage,
   validateTailscaleTags,
 } from "./tailscale";
+import { orderedTelemetrySamples } from "./telemetry";
 import { timingSafeEqual } from "./timing-safe";
 import type {
   CapacityHint,
@@ -1165,6 +1179,18 @@ export class FleetCoordinator {
           market: result.market,
           ...(result.server.region ? { region: result.server.region } : {}),
           ...(result.image ? { image: result.image } : {}),
+          ...(result.access
+            ? {
+                sshUser: result.access.sshUser,
+                sshPort: result.access.sshPort,
+                sshFallbackPorts: [...result.access.sshFallbackPorts],
+                workRoot: result.access.workRoot,
+                ...(result.access.sshHostKey ? { sshHostKey: result.access.sshHostKey } : {}),
+                ...(result.access.tailscale
+                  ? { tailscale: structuredClone(result.access.tailscale) }
+                  : {}),
+              }
+            : {}),
         };
         clearProvisioningRecoveryMetadata(completed);
         delete completed.provisioningResourceMayExist;
@@ -1309,10 +1335,12 @@ export class FleetCoordinator {
         return await this.adminTailscalePreflight();
       }
       if (parts[0] === "v1" && parts[1] === "admin" && parts[2] === "hosts") {
-        return await this.adminHostsRoute(request, parts[3]);
+        if (parts.length > 5) return notFound();
+        return await this.adminHostsRoute(request, parts[3], parts[4]);
       }
       if (parts[0] === "v1" && parts[1] === "admin" && parts[2] === "mac-hosts") {
-        return await this.adminMacHostsRoute(request, parts[3]);
+        if (parts.length > 5) return notFound();
+        return await this.adminMacHostsRoute(request, parts[3], parts[4]);
       }
       if (
         (method === "GET" || method === "POST") &&
@@ -3884,64 +3912,15 @@ export class FleetCoordinator {
       );
     }
     const requestedHostID = config.hostID || config.awsMacHostID;
-    const retainedMacHostLease =
-      !fixedLeaseID && requestedHostID && config.provider === "aws" && config.target === "macos"
-        ? await this.retainedMacHostLease(
-            owner,
-            org,
-            requestedHostID,
-            config.serverTypeExplicit ? config.serverType : undefined,
-          )
-        : undefined;
-    const reusesOwnedReleasedMacHost = Boolean(retainedMacHostLease);
-    if (
-      !isAdminRequest(request) &&
-      requestedHostID &&
-      !reusesOwnedReleasedMacHost &&
-      requestedHostID !== checkpointAuthorization?.checkpoint.hostID
-    ) {
-      return json(
-        {
-          error: "admin_required",
-          message: "provider host pinning requires admin-token auth",
-        },
-        { status: 403 },
-      );
-    }
-    if (retainedMacHostLease) {
-      if (hasImageRequirements(config.imageRequirements)) {
-        return json(
-          {
-            error: "image_capability_mismatch",
-            message: "image capability requirements cannot be verified when reusing an instance",
-          },
-          { status: 409 },
-        );
-      }
-      const missingCapabilities = [
-        config.desktop && !retainedMacHostLease.desktop ? "desktop" : "",
-        config.browser && !retainedMacHostLease.browser ? "browser" : "",
-        config.code && !retainedMacHostLease.code ? "code" : "",
-      ].filter(Boolean);
-      if (missingCapabilities.length > 0) {
-        return json(
-          {
-            error: "retained_instance_capability_mismatch",
-            message: `retained EC2 Mac instance lacks requested capabilities: ${missingCapabilities.join(", ")}`,
-          },
-          { status: 409 },
-        );
-      }
-    }
-    if (retainedMacHostLease && !config.serverTypeExplicit) {
-      config = { ...config, serverType: retainedMacHostLease.serverType };
-    }
-    if (retainedMacHostLease) {
-      config = { ...config, providerKey: retainedMacHostLease.providerKey };
-    }
+    const hostPinError = await this.validateHostPin(
+      request,
+      config,
+      checkpointAuthorization?.checkpoint.hostID,
+    );
+    if (hostPinError) return hostPinError;
     const canonicalProviderKey = providerKeyForLease(leaseID);
     const providerKeyLeaseID = leaseIDForProviderKey(config.providerKey);
-    if (!retainedMacHostLease && providerKeyLeaseID && providerKeyLeaseID !== leaseID) {
+    if (providerKeyLeaseID && providerKeyLeaseID !== leaseID) {
       return json(
         {
           error: "reserved_provider_key",
@@ -3952,7 +3931,6 @@ export class FleetCoordinator {
     }
     if (
       !workspaceID &&
-      !retainedMacHostLease &&
       !isAdminRequest(request) &&
       config.providerKey &&
       config.providerKey !== canonicalProviderKey
@@ -3979,6 +3957,16 @@ export class FleetCoordinator {
           provider: readiness.provider,
           missing: readiness.missing,
           message: readiness.message,
+        },
+        { status: 424 },
+      );
+    }
+    if (config.provider === "koyeb" && this.env.CRABBOX_DURABLE_PROVISIONING_ADMISSION !== "true") {
+      return json(
+        {
+          error: "durable_provisioning_required",
+          provider: "koyeb",
+          message: "Koyeb Sandbox leases require durable provisioning admission",
         },
         { status: 424 },
       );
@@ -4091,228 +4079,14 @@ export class FleetCoordinator {
         fixedCreate,
       );
     }
-    if (!workspaceID && retainedMacHostLease) {
-      const reactivation = await this.state.runExclusive(async () => {
-        const reservedAttempt = await this.getCreateAttempt(leaseID);
-        const currentAttempt = createAttempt
-          ? await this.pendingCreateAttempt(leaseID, createAttempt.token, owner, org)
-          : undefined;
-        if (currentAttempt?.canonicalLeaseID) {
-          const replayLease = await this.getLease(currentAttempt.canonicalLeaseID);
-          if (!replayLease || !createAttemptMatchesLease(currentAttempt, replayLease)) {
-            return createAttemptBindingConflictResponse();
-          }
-          return createAttemptReplayResponse(replayLease);
-        }
-        if (createAttempt && !currentAttempt) {
-          return createCanceledResponse();
-        }
-        if (!createAttempt && reservedAttempt) {
-          return createAttemptIDConflictResponse();
-        }
-        const current = await this.getLease(retainedMacHostLease.id);
-        if (
-          !current ||
-          current.state !== "released" ||
-          current.releaseDeletesServer !== false ||
-          !current.cloudID ||
-          current.owner !== owner ||
-          current.org !== org ||
-          current.provider !== "aws" ||
-          current.target !== "macos" ||
-          leaseHostID(current) !== requestedHostID ||
-          current.serverType !== config.serverType
-        ) {
-          return undefined;
-        }
-        if (
-          (await this.getLease(leaseID)) ||
-          (await this.state.storage.get(workspaceLeaseReservationKey(leaseID)))
-        ) {
-          return createAttemptIDConflictResponse();
-        }
-        const blocked = await reservationGuard?.();
-        if (blocked) {
-          return blocked;
-        }
-        const now = new Date();
-        const admission = await this.leaseAdmissionState({ owner, org }, now, current.id);
-        const createAttemptGeneration = newCreateAttemptGeneration();
-        const boundAttempt: CreateAttemptRecord | undefined = currentAttempt
-          ? {
-              ...currentAttempt,
-              canonicalLeaseID: current.id,
-              cloudID: current.cloudID,
-              generation: createAttemptGeneration!,
-              updatedAt: now.toISOString(),
-            }
-          : undefined;
-        let reactivated: LeaseRecord = {
-          ...current,
-          ...(checkpointAuthorization
-            ? { checkpointID: checkpointAuthorization.checkpoint.id }
-            : {}),
-          createAttemptGeneration,
-          ...(boundAttempt
-            ? {
-                createAttemptID: boundAttempt.token,
-              }
-            : {}),
-          profile: config.profile,
-          class: config.class,
-          requestedServerType: config.serverType,
-          keep: config.keep,
-          ttlSeconds: config.ttlSeconds,
-          idleTimeoutSeconds: config.idleTimeoutSeconds,
-          estimatedHourlyUSD: cost.hourlyUSD,
-          maxEstimatedUSD: cost.maxUSD,
-          state: "provisioning",
-          createdAt: now.toISOString(),
-          updatedAt: now.toISOString(),
-          lastTouchedAt: now.toISOString(),
-          expiresAt: leaseExpiresAt(
-            now,
-            now,
-            config.ttlSeconds,
-            config.idleTimeoutSeconds,
-          ).toISOString(),
-        };
-        if (!boundAttempt) {
-          delete reactivated.createAttemptID;
-        }
-        const sourceCIDRs = awsLeaseSSHSourceCIDRs(
-          config,
-          providerAccessContext(requestSourceCIDRs(request), admission.accessLeases),
-        );
-        reactivated = withLeaseSSHSourceCIDRs(
-          reactivated,
-          sourceCIDRs,
-          sourceCIDRs.length > 0 || awsGlobalSSHSourceCIDRs(this.env).length > 0,
-        );
-        if (config.awsSSHCIDRsPinned) {
-          reactivated.network = {
-            ...reactivated.network,
-            sshPinnedSourceCIDRs: sourceCIDRs,
-          };
-        } else if (reactivated.network) {
-          delete reactivated.network.sshPinnedSourceCIDRs;
-        }
-        delete reactivated.releasedAt;
-        delete reactivated.endedAt;
-        delete reactivated.releaseDeletesServer;
-        delete reactivated.failureError;
-        delete reactivated.provisioningRequestStartedAt;
-        delete reactivated.provisioningCoordinatorVersion;
-        delete reactivated.provisioningRequestSettledAt;
-        delete reactivated.provisioningRecoveryObservedAt;
-        delete reactivated.provisioningRecoveryMissingSince;
-        clearLeaseCleanupMetadata(reactivated);
-        clearLeaseCleanupCompletion(reactivated);
-        const limitError = enforceCostLimitUsage(
-          admission.costUsage,
-          reactivated,
-          costLimits(this.env),
-        );
-        if (limitError) {
-          return json({ error: "cost_limit_exceeded", message: limitError }, { status: 429 });
-        }
-        if (boundAttempt) {
-          await this.putCreateAttempt(boundAttempt);
-        }
-        await this.putLease(reactivated);
-        await this.markAWSIngressReconcilePending(reactivated);
-        await this.scheduleAlarm();
-        return {
-          previous: structuredClone(current),
-          previousAttempt: currentAttempt ? structuredClone(currentAttempt) : undefined,
-          boundAttempt: boundAttempt ? structuredClone(boundAttempt) : undefined,
-          reactivated,
-        };
-      });
-      if (reactivation instanceof Response) {
-        return reactivation;
-      }
-      if (reactivation) {
-        try {
-          if (provider.reconcileLeaseAccess) {
-            const accessLeases = await this.providerAccessLeaseRecords();
-            await this.withAWSIngressOperationLock(() =>
-              provider.reconcileLeaseAccess!(
-                reactivation.reactivated,
-                providerAccessContext(requestSourceCIDRs(request), accessLeases),
-              ),
-            );
-          }
-        } catch (error) {
-          await this.state.runExclusive(async () => {
-            const current = await this.getLease(reactivation.reactivated.id);
-            if (
-              current?.state === "provisioning" &&
-              sameLeaseReleaseIdentity(current, reactivation.reactivated)
-            ) {
-              await this.putLease(reactivation.previous);
-              if (reactivation.boundAttempt) {
-                const currentAttempt = await this.getCreateAttempt(
-                  reactivation.boundAttempt.requestedLeaseID,
-                );
-                if (
-                  currentAttempt &&
-                  sameCreateAttempt(currentAttempt, reactivation.boundAttempt)
-                ) {
-                  if (reactivation.previousAttempt) {
-                    await this.putCreateAttempt(reactivation.previousAttempt);
-                  } else {
-                    await this.state.storage.delete(
-                      createAttemptKey(reactivation.boundAttempt.requestedLeaseID),
-                    );
-                  }
-                }
-              }
-              await this.scheduleAlarm();
-            }
-          });
-          throw error;
-        }
-        const activation = await this.state.runExclusive(async () => {
-          const current = await this.getLease(reactivation.reactivated.id);
-          const pending = createAttempt
-            ? await this.pendingCreateAttempt(leaseID, createAttempt.token, owner, org)
-            : undefined;
-          if (
-            !current ||
-            current.state !== "provisioning" ||
-            !sameLeaseReleaseIdentity(current, reactivation.reactivated) ||
-            (createAttempt && (!pending || !createAttemptMatchesLease(pending, current)))
-          ) {
-            return { committed: false as const, current, pending };
-          }
-          current.state = "active";
-          current.updatedAt = new Date().toISOString();
-          await this.putLease(current);
-          await this.scheduleAlarm();
-          return { committed: true as const, current };
-        });
-        if (!activation.committed) {
-          if (createAttempt && !activation.pending) {
-            return createCanceledResponse();
-          }
-          return json(
-            {
-              error: "lease_state_changed",
-              message: "retained lease changed state while access reconciliation was in progress",
-              lease: activation.current ? publicLeaseRecord(activation.current) : undefined,
-            },
-            { status: 409 },
-          );
-        }
-        return json({ lease: publicLeaseRecord(activation.current) }, { status: 201 });
-      }
+    if (config.provider === "koyeb") {
       return json(
         {
-          error: "retained_instance_unavailable",
-          message: "retained EC2 Mac instance is no longer available for reactivation",
+          error: "durable_provisioning_required",
+          provider: "koyeb",
+          message: "Koyeb Sandbox leases require an available durable provisioning capability",
         },
-        { status: 409 },
+        { status: 424 },
       );
     }
     const reservation = await this.state.runExclusive(async () => {
@@ -4362,6 +4136,13 @@ export class FleetCoordinator {
           { status: 409 },
         );
       }
+      const reservationHostError = await this.validateHostPin(
+        request,
+        config,
+        checkpointAuthorization?.checkpoint.hostID,
+        true,
+      );
+      if (reservationHostError) return reservationHostError;
       const now = new Date();
       const createAttemptGeneration = currentAttempt ? newCreateAttemptGeneration() : undefined;
       const admission = await this.leaseAdmissionState({ owner, org }, now);
@@ -5026,6 +4807,9 @@ export class FleetCoordinator {
         serverID: 0,
         serverName: "",
         host: "",
+        ...(config.hostID || config.awsMacHostID
+          ? { hostId: config.hostID || config.awsMacHostID }
+          : {}),
         providerKey: config.providerKey,
         sshUser: config.sshUser,
         sshPort: config.sshPort,
@@ -5111,6 +4895,23 @@ export class FleetCoordinator {
       const storedLeases = [
         ...(await transaction.list<LeaseRecord>({ prefix: "lease:" })).values(),
       ];
+      const hostID = config.hostID || config.awsMacHostID;
+      const scope: HostScope = {
+        provider: config.provider,
+        hostID: hostID || "",
+        region: providerRegionForConfig(config),
+      };
+      const hostReservations = hostID ? await readHostReservations(transaction, scope) : [];
+      const hostConflict = pinnedHostConflict(
+        config,
+        hostReservations
+          .filter((reservation) => !reservation.staleReason && reservation.lease)
+          .map((reservation) => reservation.lease!),
+      );
+      if (hostConflict) return hostConflict;
+      const clearedHostReservations = hostReservations.filter(
+        (reservation) => reservation.staleReason,
+      );
       const providerAccess = [
         ...(await transaction.list<LeaseRecord>({ prefix: providerAccessPrefix() })).values(),
       ];
@@ -5133,6 +4934,7 @@ export class FleetCoordinator {
       for (const lease of merged.values()) addLeaseToCostLimitUsage(usage, lease, now);
       const limit = enforceCostLimitUsage(usage, record, costLimits(this.env));
       if (limit) return json({ error: "cost_limit_exceeded", message: limit }, { status: 429 });
+      await clearHostReservations(transaction, clearedHostReservations);
       if (currentAttempt && attempt)
         await transaction.put(createAttemptKey(leaseID), {
           ...currentAttempt,
@@ -5144,9 +4946,11 @@ export class FleetCoordinator {
       await transaction.put(provisioningPlanKey(operationID), prepared.plan);
       await transaction.put(provisioningMaterialKey(operationID), sealed);
       await putProvisioningOperation(transaction, operation);
-      return { lease: record, replay: false };
+      return { lease: record, replay: false, clearedHostReservations, hostScope: scope };
     });
     if (admission instanceof Response) return admission;
+    if (admission.hostScope && admission.clearedHostReservations)
+      logClearedHostReservations(admission.hostScope, admission.clearedHostReservations);
     if (admission.replay) {
       // A concurrent release may commit before admission's acknowledgement returns.
       // Replay must observe the current attempt rather than its earlier lease snapshot.
@@ -8569,6 +8373,7 @@ export class FleetCoordinator {
               target: normalizeReadinessTarget(url.searchParams.get("target")),
               windowsMode: normalizeReadinessWindowsMode(url.searchParams.get("windowsMode")),
               architecture: url.searchParams.get("architecture") ?? "amd64",
+              sshPublicKey: readinessDummySSHPublicKey,
             },
             {
               allowAzurePromotedImage: true,
@@ -8585,6 +8390,8 @@ export class FleetCoordinator {
         }
         const admissionEnabled = this.env.CRABBOX_DURABLE_PROVISIONING_ADMISSION === "true";
         const materialConfigured = provisioningMaterialConfigured(this.env);
+        const runtimeAvailable = Boolean(this.state.provisioning);
+        const missing = resumableProvisioningMissing(provider, this.env, runtimeAvailable);
         return json({
           ...readiness,
           resumableProvisioning: {
@@ -8595,8 +8402,9 @@ export class FleetCoordinator {
               supported &&
               admissionEnabled &&
               materialConfigured &&
-              Boolean(this.state.provisioning),
-            missing: materialConfigured ? [] : ["CRABBOX_SESSION_SECRET"],
+              runtimeAvailable &&
+              (provider !== "koyeb" || missing.length === 0),
+            missing,
           },
         });
       }
@@ -12801,13 +12609,16 @@ export class FleetCoordinator {
               ? await this.provider("gcp").listCrabboxServers()
               : provider === "daytona"
                 ? await this.provider("daytona").listCrabboxServers()
-                : [
-                    ...(await this.provider("hetzner").listCrabboxServers()),
-                    ...(await this.listProviderMachinesSafe("aws")),
-                    ...(await this.listProviderMachinesSafe("azure")),
-                    ...(await this.listProviderMachinesSafe("gcp")),
-                    ...(await this.listProviderMachinesSafe("daytona")),
-                  ];
+                : provider === "koyeb"
+                  ? await this.provider("koyeb").listCrabboxServers()
+                  : [
+                      ...(await this.provider("hetzner").listCrabboxServers()),
+                      ...(await this.listProviderMachinesSafe("aws")),
+                      ...(await this.listProviderMachinesSafe("azure")),
+                      ...(await this.listProviderMachinesSafe("gcp")),
+                      ...(await this.listProviderMachinesSafe("daytona")),
+                      ...(await this.listProviderMachinesSafe("koyeb")),
+                    ];
     return json({ machines });
   }
 
@@ -14191,7 +14002,11 @@ export class FleetCoordinator {
     return json({ tailscale: await tailscalePreflight(this.env) });
   }
 
-  private async adminHostsRoute(request: Request, hostID?: string): Promise<Response> {
+  private async adminHostsRoute(
+    request: Request,
+    hostID?: string,
+    action?: string,
+  ): Promise<Response> {
     const url = new URL(request.url);
     const provider = (url.searchParams.get("provider") ?? "aws").trim().toLowerCase();
     const target = (url.searchParams.get("target") ?? "macos").trim().toLowerCase();
@@ -14204,10 +14019,14 @@ export class FleetCoordinator {
         { status: 400 },
       );
     }
-    return await this.adminMacHostsRoute(request, hostID);
+    return await this.adminMacHostsRoute(request, hostID, action);
   }
 
-  private async adminMacHostsRoute(request: Request, hostID?: string): Promise<Response> {
+  private async adminMacHostsRoute(
+    request: Request,
+    hostID?: string,
+    action?: string,
+  ): Promise<Response> {
     const method = request.method.toUpperCase();
     const url = new URL(request.url);
     const queryRegion = url.searchParams.get("region") ?? this.env.CRABBOX_AWS_REGION ?? "";
@@ -14218,6 +14037,41 @@ export class FleetCoordinator {
         { status: 400 },
       );
     }
+    if (action === "reservation" && hostID) {
+      if (!/^h-[a-f0-9]+$/.test(hostID)) return json({ error: "invalid_host_id" }, { status: 400 });
+      if (method !== "GET" && method !== "POST") return notFound();
+      const scope: HostScope = { provider: "aws", hostID, region };
+      const force = url.searchParams.get("force") === "true";
+      return this.state.runExclusive(async () => {
+        const result = await this.state.storage.transaction(async (storage) => {
+          const reservations = await readHostReservations(storage, scope);
+          const blocked = reservations.some((reservation) => !reservation.staleReason);
+          if (method === "POST" && blocked && !force) {
+            return json(
+              {
+                error: "host_in_use",
+                message:
+                  "host reservation references a live or potentially retained instance; use --force only after inspecting it",
+                ...scope,
+                reservations: reservations.map(publicHostReservation),
+              },
+              { status: 409 },
+            );
+          }
+          if (method === "POST") await clearHostReservations(storage, reservations);
+          return reservations;
+        });
+        if (result instanceof Response) return result;
+        if (method === "POST")
+          logClearedHostReservations(scope, result, "admin_reservation_cleared");
+        return json({
+          ...scope,
+          reservations: result.map(publicHostReservation),
+          ...(method === "POST" ? { cleared: result.length } : {}),
+        });
+      });
+    }
+    if (action) return notFound();
     const client = new EC2SpotClient(this.env, region);
     if (method === "GET" && hostID === "offerings") {
       const serverType = (url.searchParams.get("type") ?? "mac2.metal").trim();
@@ -14255,7 +14109,15 @@ export class FleetCoordinator {
       const serverType = (url.searchParams.get("type") ?? "").trim();
       const state = (url.searchParams.get("state") ?? "").trim();
       const hosts = await client.listMacHosts(serverType, state);
-      return json({ hosts });
+      const allocatedHosts = await Promise.all(
+        hosts.map(async (host) => {
+          const allocation = await this.state.storage.get<AWSMacHostAllocation>(
+            awsMacHostAllocationKey(region, host.id),
+          );
+          return { ...host, ...(allocation ? { org: orgLabelForDisplay(allocation.org) } : {}) };
+        }),
+      );
+      return json({ hosts: allocatedHosts });
     }
     if (method === "POST" && hostID === "dry-run") {
       const input = await readJson<{
@@ -14348,9 +14210,16 @@ export class FleetCoordinator {
               offering.availabilityZone,
               `${clientToken}-${offering.availabilityZone.replaceAll("-", "")}`,
             );
-            return json(
-              { hosts, availabilityZone: offering.availabilityZone, offerings },
-              { status: 201 },
+            // Return the persistence promise without catching failures as AWS capacity failures.
+            return recordAWSMacHostAllocations(
+              this.state.storage,
+              hosts,
+              requestOrg(request, this.env),
+            ).then(() =>
+              json(
+                { hosts, availabilityZone: offering.availabilityZone, offerings },
+                { status: 201 },
+              ),
             );
           } catch (error) {
             const message = coordinatorErrorMessage(this.env, error);
@@ -14367,6 +14236,7 @@ export class FleetCoordinator {
         );
       }
       const hosts = await client.allocateMacHost(serverType, availabilityZone, clientToken);
+      await recordAWSMacHostAllocations(this.state.storage, hosts, requestOrg(request, this.env));
       return json({ hosts }, { status: 201 });
     }
     if (method === "DELETE" && hostID) {
@@ -14654,11 +14524,19 @@ export class FleetCoordinator {
   private filterLeasesWithoutLimit(leases: LeaseRecord[], request: Request): LeaseRecord[] {
     const url = new URL(request.url);
     const state = url.searchParams.get("state") ?? "";
+    const current = url.searchParams.get("view") === "current";
     const provider = url.searchParams.get("provider") ?? "";
     const owner = url.searchParams.get("owner") ?? "";
     const org = orgFilterKey(url);
     if (org === null) return [];
     return leases
+      .filter(
+        (lease) =>
+          !current ||
+          leaseIsLive(lease) ||
+          ((lease.keep || lease.releaseDeletesServer === false) &&
+            !leaseProviderCleanupConfirmed(lease)),
+      )
       .filter((lease) => !state || lease.state === state)
       .filter((lease) => !provider || lease.provider === provider)
       .filter((lease) => !owner || lease.owner === owner)
@@ -18046,31 +17924,54 @@ export class FleetCoordinator {
     return [...leases.values()];
   }
 
-  private async retainedMacHostLease(
-    owner: string,
-    org: string,
-    hostID: string,
-    serverType?: string,
-  ): Promise<LeaseRecord | undefined> {
-    let retained: LeaseRecord | undefined;
-    await this.visitLeaseRecords((lease) => {
-      if (
-        lease.state !== "released" ||
-        lease.releaseDeletesServer !== false ||
-        !lease.cloudID ||
-        lease.owner !== owner ||
-        lease.org !== org ||
-        lease.provider !== "aws" ||
-        lease.target !== "macos" ||
-        leaseHostID(lease) !== hostID ||
-        (serverType !== undefined && lease.serverType !== serverType) ||
-        (retained !== undefined && retained.updatedAt >= lease.updatedAt)
-      ) {
-        return;
-      }
-      retained = lease;
-    });
-    return retained;
+  private async validateHostPin(
+    request: Request,
+    config: LeaseConfig,
+    authorizedHostID?: string,
+    repair = false,
+  ): Promise<Response | undefined> {
+    const hostID = config.hostID || config.awsMacHostID;
+    if (!hostID) return undefined;
+    const provider = this.provider(
+      config.provider,
+      providerRegionForConfig(config),
+      providerProjectForConfig(config),
+    );
+    if (
+      !isAdminRequest(request) &&
+      hostID !== authorizedHostID &&
+      !(await provider.authorizeHostPin?.(config, requestOrg(request, this.env)))
+    ) {
+      return json(
+        {
+          error: "admin_required",
+          message:
+            "provider host pinning requires admin-token auth or a coordinator allocation for your organization",
+        },
+        { status: 403 },
+      );
+    }
+    const scope: HostScope = {
+      provider: config.provider,
+      hostID,
+      region: providerRegionForConfig(config),
+    };
+    const inspect = async (storage: CoordinatorStorageView) => {
+      const reservations = await readHostReservations(storage, scope);
+      const stale = reservations.filter((reservation) => reservation.staleReason);
+      if (repair) await clearHostReservations(storage, stale);
+      return {
+        stale,
+        leases: reservations
+          .filter((reservation) => !reservation.staleReason && reservation.lease)
+          .map((reservation) => reservation.lease!),
+      };
+    };
+    const result = repair
+      ? await this.state.storage.transaction(inspect)
+      : await inspect(this.state.storage);
+    if (repair) logClearedHostReservations(scope, result.stale);
+    return pinnedHostConflict(config, result.leases);
   }
 
   private async leaseAdmissionState(
@@ -18501,8 +18402,9 @@ export class FleetCoordinator {
   }
 
   private filterLeasesForRequest(leases: LeaseRecord[], request: Request): LeaseRecord[] {
-    return this.filterLeases(leases, request).filter((lease) =>
-      this.leaseVisibleToRequest(lease, request, false),
+    return this.filterLeases(
+      leases.filter((lease) => this.leaseVisibleToRequest(lease, request, false)),
+      request,
     );
   }
 
@@ -19009,6 +18911,9 @@ export class FleetCoordinator {
     }
     if (provider === "daytona") {
       return new DaytonaProvider(this.env);
+    }
+    if (provider === "koyeb") {
+      return new KoyebProvider(this.env);
     }
     return new HetznerProvider(this.env);
   }
@@ -19721,6 +19626,18 @@ function providerReadiness(provider: Provider, env: Env, gcpProject?: string): P
           : `${spec.provider} coordinator configuration missing: ${missing.join(", ")}`,
     };
   }
+  if (provider === "koyeb") {
+    const missing = koyebConfigurationMissing(env);
+    return {
+      provider,
+      configured: missing.length === 0,
+      missing,
+      message:
+        missing.length === 0
+          ? "koyeb coordinator configuration is configured"
+          : `koyeb coordinator configuration missing or invalid: ${missing.join(", ")}`,
+    };
+  }
   const missing = providerRequiredSecrets(provider).filter((name) => !nonSecretString(env[name]));
   return {
     provider,
@@ -19731,6 +19648,30 @@ function providerReadiness(provider: Provider, env: Env, gcpProject?: string): P
         ? `${spec.provider} coordinator secrets are configured`
         : `${spec.provider} coordinator secrets missing: ${missing.join(", ")}`,
   };
+}
+
+function resumableProvisioningMissing(
+  provider: Provider,
+  env: Env,
+  runtimeAvailable: boolean,
+): string[] {
+  const missing: string[] = [];
+  if (!provisioningMaterialConfigured(env)) missing.push("CRABBOX_SESSION_SECRET");
+  if (provider !== "koyeb") return missing;
+  if (env.CRABBOX_DURABLE_PROVISIONING_ADMISSION !== "true") {
+    missing.push("CRABBOX_DURABLE_PROVISIONING_ADMISSION");
+  }
+  if (!runtimeAvailable) missing.push("transactional provisioning runtime");
+  if (!koyebPrivateMeshAvailable(env)) {
+    if (env.CRABBOX_TAILSCALE_ENABLED === "0") missing.push("CRABBOX_TAILSCALE_ENABLED");
+    if (!nonSecretString(env.CRABBOX_TAILSCALE_CLIENT_ID)) {
+      missing.push("CRABBOX_TAILSCALE_CLIENT_ID");
+    }
+    if (!nonSecretString(env.CRABBOX_TAILSCALE_CLIENT_SECRET)) {
+      missing.push("CRABBOX_TAILSCALE_CLIENT_SECRET");
+    }
+  }
+  return missing;
 }
 
 const readinessDummySSHPublicKey =
@@ -21665,8 +21606,7 @@ function createAttemptMatchesLease(attempt: CreateAttemptRecord, lease: LeaseRec
         attempt.fixedCreate.hash === lease.fixedCreateIntentHash &&
         attempt.fixedCreate.provider === lease.provider)) &&
     createAttemptMatchesCheckpoint(attempt, lease.checkpointID, attempt.checkpointUseClaimHash) &&
-    (attempt.requestedLeaseID === lease.id ||
-      (lease.provider === "aws" && lease.target === "macos")) &&
+    attempt.requestedLeaseID === lease.id &&
     !lease.workspaceID &&
     !isRegisteredLease(lease)
   );
@@ -24862,7 +24802,8 @@ function boundedRunEvent(
     input.provider === "hetzner" ||
     input.provider === "azure" ||
     input.provider === "gcp" ||
-    input.provider === "daytona"
+    input.provider === "daytona" ||
+    input.provider === "koyeb"
   ) {
     event.provider = input.provider;
   }
@@ -25210,15 +25151,7 @@ function appendLeaseTelemetryHistory(
 }
 
 function boundedTelemetrySamples(samples: LeaseTelemetry[], max: number): LeaseTelemetry[] {
-  const byTime = new Map<string, LeaseTelemetry>();
-  for (const sample of samples) {
-    if (sample?.capturedAt) {
-      byTime.set(sample.capturedAt, sample);
-    }
-  }
-  return [...byTime.values()]
-    .toSorted((left, right) => left.capturedAt.localeCompare(right.capturedAt))
-    .slice(-max);
+  return orderedTelemetrySamples(samples).slice(-max);
 }
 
 const fixedLeaseCreateIntentVersion = 2;
@@ -25321,6 +25254,31 @@ function activeSlugCollision(
 
 function isActiveProviderAccessRecord(lease: LeaseRecord, now: number): boolean {
   return leaseIsLive(lease) && Date.parse(lease.expiresAt) > now;
+}
+
+function pinnedHostConflict(config: LeaseConfig, leases: LeaseRecord[]): Response | undefined {
+  const hostID = config.hostID || config.awsMacHostID;
+  if (!hostID) return undefined;
+  const occupied = leases.find(
+    (lease) =>
+      lease.provider === config.provider &&
+      leaseHostID(lease) === hostID &&
+      (!lease.region || lease.region === providerRegionForConfig(config)) &&
+      (leaseIsLive(lease) ||
+        (!leaseProviderCleanupConfirmed(lease) &&
+          (lease.keep ||
+            lease.releaseDeletesServer === false ||
+            Boolean(lease.cloudID) ||
+            lease.provisioningResourceMayExist === true))),
+  );
+  if (!occupied) return undefined;
+  return json(
+    {
+      error: "host_in_use",
+      message: `host ${hostID} is occupied by lease ${occupied.id} (slug ${occupied.slug || "-"}); inspect or explicitly stop that lease before creating another`,
+    },
+    { status: 409 },
+  );
 }
 
 function leaseIsLive(lease: LeaseRecord): boolean {
@@ -26573,6 +26531,7 @@ interface CloudProvider {
   ): ProviderWorkspaceCapability | undefined;
   supportsSSHHostKeyInjection(config: ReturnType<typeof leaseConfig>): boolean;
   restrictedLeaseRequestFields?(input: LeaseRequest): string[];
+  authorizeHostPin?(config: LeaseConfig, org: string): Promise<boolean>;
   ownershipLabelValue?(value: string): string;
   recoveryIsAuthoritative?: true;
   recoverUnboundProvisioningResource?(lease: LeaseRecord): Promise<ProviderMachine | undefined>;
@@ -28022,6 +27981,85 @@ export class GCPProvider implements CloudProvider {
   }
 }
 
+export class KoyebProvider implements CloudProvider {
+  private clientValue?: KoyebClient;
+
+  constructor(
+    private readonly env: Env,
+    private readonly fetcher: typeof fetch = fetch,
+  ) {}
+
+  private get client(): KoyebClient {
+    this.clientValue ??= new KoyebClient(this.env, this.fetcher);
+    return this.clientValue;
+  }
+
+  resumableProvisioning(): ProviderResumableProvisioning {
+    return new KoyebResumableProvisioning(this.env, this.fetcher);
+  }
+
+  listCrabboxServers(): Promise<ProviderMachine[]> {
+    return this.client.listCrabboxServers();
+  }
+
+  supportsSSHHostKeyInjection(): boolean {
+    return false;
+  }
+
+  prepareLeaseConfig(
+    config: ReturnType<typeof leaseConfig>,
+  ): Promise<ReturnType<typeof leaseConfig>> {
+    return Promise.resolve({ ...config, serverType: this.client.instanceType });
+  }
+
+  createServerWithFallback(): Promise<never> {
+    throw new ProviderResourceUnresolvedError(
+      "Koyeb Sandbox creation requires durable provisioning admission; no provider mutation attempted",
+    );
+  }
+
+  releaseLease(lease: LeaseRecord): Promise<void> {
+    return this.client.deleteOwnedService(lease);
+  }
+
+  deleteServer(id: string): Promise<void> {
+    throw new ProviderResourceUnresolvedError(
+      `Koyeb Sandbox ${id} requires its retained lease and frozen allocation identity for deletion`,
+    );
+  }
+
+  supportsNativeImages(): boolean {
+    return false;
+  }
+
+  nativeImagesUnsupportedMessage(): string {
+    return "Koyeb Sandbox runner images are selected through coordinator configuration";
+  }
+
+  defaultImageStrategy(): "image" | "disk-snapshot" {
+    return "image";
+  }
+
+  validateLeaseImageStrategy(): string | undefined {
+    return undefined;
+  }
+
+  createLeaseImage = unsupportedProviderImageLifecycle("koyeb");
+  getImage = unsupportedProviderImageLifecycle("koyeb");
+  deleteImage = unsupportedProviderImageLifecycle("koyeb");
+  storedImageMetadata = noStoredImageMetadata;
+  decorateImage = passthroughProviderImage;
+  validateDeleteImage = allowProviderImageDelete;
+
+  deleteSSHKey(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  hourlyPriceUSD(): Promise<number | undefined> {
+    return Promise.resolve(undefined);
+  }
+}
+
 export class DaytonaProvider implements CloudProvider {
   readonly recoveryIsAuthoritative = true;
   private clientValue?: DaytonaClient;
@@ -28251,6 +28289,34 @@ function awsCheckpointResourceAbsent(message: string, resourceID: string): boole
   );
 }
 
+interface AWSMacHostAllocation {
+  version: 1;
+  hostID: string;
+  region: string;
+  org: string;
+}
+
+function awsMacHostAllocationKey(region: string, hostID: string): string {
+  return `aws-mac-host-allocation:${region}:${hostID}`;
+}
+
+async function recordAWSMacHostAllocations(
+  storage: CoordinatorStorage,
+  hosts: AWSMacHost[],
+  org: string,
+): Promise<void> {
+  await Promise.all(
+    hosts.map((host) =>
+      storage.put(awsMacHostAllocationKey(host.region, host.id), {
+        version: 1,
+        hostID: host.id,
+        region: host.region,
+        org,
+      } satisfies AWSMacHostAllocation),
+    ),
+  );
+}
+
 export class AWSProvider implements CloudProvider {
   private clientValue?: EC2SpotClient;
   private readonly region: string;
@@ -28266,6 +28332,21 @@ export class AWSProvider implements CloudProvider {
   private get client(): EC2SpotClient {
     this.clientValue ??= new EC2SpotClient(this.env, this.region);
     return this.clientValue;
+  }
+
+  async authorizeHostPin(config: LeaseConfig, org: string): Promise<boolean> {
+    const hostID = config.hostID || config.awsMacHostID;
+    if (config.target !== "macos" || !hostID || org === MISSING_ORG_KEY || !isCurrentOrgKey(org))
+      return false;
+    const allocation = await this.storage.get<AWSMacHostAllocation>(
+      awsMacHostAllocationKey(this.region, hostID),
+    );
+    return (
+      allocation?.version === 1 &&
+      allocation.region === this.region &&
+      allocation.hostID === hostID &&
+      sameOrgIdentityKey(allocation.org, org)
+    );
   }
 
   readyPoolImageIdentity(lease: LeaseRecord): ReadyPoolImageIdentity | undefined {

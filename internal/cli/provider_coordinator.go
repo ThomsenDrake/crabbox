@@ -1094,7 +1094,8 @@ func filterCoordinatorLeasesForProvider(leases []CoordinatorLease, provider stri
 }
 
 func redactCoordinatorLeaseListSecrets(leases []CoordinatorLease) []CoordinatorLease {
-	out := append([]CoordinatorLease(nil), leases...)
+	out := make([]CoordinatorLease, len(leases))
+	copy(out, leases)
 	for i := range out {
 		if strings.EqualFold(strings.TrimSpace(out[i].Provider), "daytona") && out[i].SSHUser != "" {
 			out[i].SSHUser = "<token>"
@@ -1213,6 +1214,20 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 				return false, adminErr
 			}
 			observationCoord = adminCoord
+		} else if isCoordinatorNotFoundError(err) {
+			// A missing mutation target is not proof of cleanup by itself. Only
+			// accept an idempotent retry after a separate current-inventory read,
+			// scoped to the same authenticated owner and selected provider.
+			leases, confirmErr := b.listUserLeases(ctx)
+			if confirmErr != nil {
+				return false, errors.Join(err, fmt.Errorf("confirm coordinator lease absence: %w", confirmErr))
+			}
+			for _, lease := range leases {
+				if lease.ID == req.Lease.LeaseID {
+					return false, err
+				}
+			}
+			return finish()
 		} else {
 			return false, err
 		}

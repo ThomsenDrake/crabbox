@@ -3051,6 +3051,88 @@ func TestStopCoordinatorInspectFailureKeepsProviderBinding(t *testing.T) {
 	}
 }
 
+func TestStopCoordinatorMissingLeaseRequiresFreshInventoryAbsence(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		inventoryStatus int
+		leases          []CoordinatorLease
+		wantSuccess     bool
+	}{
+		{name: "confirmed absent", leases: []CoordinatorLease{}, wantSuccess: true},
+		{name: "still present", leases: []CoordinatorLease{{ID: "cbx_stop_missing", Provider: "aws", State: "active"}}},
+		{name: "inventory unavailable", inventoryStatus: http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			isolateTestUserDirs(t)
+			configureCoordinatorReleaseTestTiming(t, time.Second, 0)
+			var releaseRequests, inventoryRequests int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/leases/cbx_stop_missing":
+					http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/leases/cbx_stop_missing/release":
+					releaseRequests++
+					http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/leases":
+					inventoryRequests++
+					if got := r.URL.Query().Get("view"); got != "current" {
+						t.Fatalf("inventory view=%q want current", got)
+					}
+					if got := r.URL.Query().Get("provider"); got != "aws" {
+						t.Fatalf("inventory provider=%q want aws", got)
+					}
+					if test.inventoryStatus != 0 {
+						http.Error(w, `{"error":"inventory_failed"}`, test.inventoryStatus)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"leases": test.leases})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			t.Setenv("CRABBOX_COORDINATOR", server.URL)
+			t.Setenv("CRABBOX_COORDINATOR_TOKEN", "user-token")
+
+			err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+				"--provider", "aws", "--id", "cbx_stop_missing",
+			})
+			if (err == nil) != test.wantSuccess {
+				t.Fatalf("stop err=%v wantSuccess=%t", err, test.wantSuccess)
+			}
+			if releaseRequests == 0 || inventoryRequests != 1 {
+				t.Fatalf("release requests=%d inventory requests=%d", releaseRequests, inventoryRequests)
+			}
+		})
+	}
+}
+
+func TestCoordinatorListJSONEncodesEmptyArray(t *testing.T) {
+	clearConfigEnv(t)
+	isolateTestUserDirs(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/leases" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"leases": nil})
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "user-token")
+
+	var stdout bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: io.Discard}).list(context.Background(), []string{
+		"--provider", "aws", "--json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); got != "[]\n" {
+		t.Fatalf("list output=%q want empty JSON array", got)
+	}
+}
+
 func TestStopForceCoordinatorRequiresLiveExactLease(t *testing.T) {
 	tests := []struct {
 		name        string

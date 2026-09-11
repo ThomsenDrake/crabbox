@@ -1249,6 +1249,20 @@ describe("Koyeb Sandbox coordinator adapter", () => {
 });
 
 describe("Koyeb Fleet integration", () => {
+  it("runs scheduled maintenance with Koyeb as the workspace provider", async () => {
+    const coordinator = new FleetCoordinator(
+      new ProvisioningTestRuntime(new ProvisioningTestStorage()),
+      {
+        ...fleetEnv,
+        CRABBOX_WORKSPACE_PROVIDER: "koyeb",
+      },
+    ) as unknown as {
+      runScheduledMaintenance: () => Promise<void>;
+    };
+
+    await expect(coordinator.runScheduledMaintenance()).resolves.toBeUndefined();
+  });
+
   it("uses the configured instance type for readiness, admission, and publication", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const storage = new ProvisioningTestStorage();

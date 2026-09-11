@@ -21669,7 +21669,7 @@ function workspaceCreateInput(value: unknown): WorkspaceCreateRequest | undefine
 
 function workspaceProvider(value: string | undefined): Provider {
   const provider = value?.trim() || "hetzner";
-  if (!["hetzner", "aws", "azure", "gcp"].includes(provider)) {
+  if (!["hetzner", "aws", "azure", "gcp", "koyeb"].includes(provider)) {
     throw new Error(`unsupported workspace provider: ${provider}`);
   }
   return provider as Provider;

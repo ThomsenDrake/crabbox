@@ -140,6 +140,15 @@ function service(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function inventoryServices(count: number, offset = 0) {
+  return Array.from({ length: count }, (_, index) =>
+    service({
+      id: `55555555-5555-4555-8555-${(offset + index + 1).toString(16).padStart(12, "0")}`,
+      name: `inventory-${offset + index + 1}`,
+    }),
+  );
+}
+
 function deployment(providerSecret: string, overrides: Record<string, unknown> = {}) {
   return {
     id: deploymentID,
@@ -267,6 +276,169 @@ async function advanceFleetProvisioning(
   }
   throw new Error("Koyeb provisioning did not publish an active lease");
 }
+
+describe("Koyeb service inventory", () => {
+  it("collects 101 services while preserving scope and name filters on every page", async () => {
+    const inventory = inventoryServices(101);
+    const requests: Request[] = [];
+    const client = new KoyebClient(baseEnv, async (request) => {
+      const incoming = request instanceof Request ? request : new Request(request);
+      requests.push(incoming);
+      const offset = Number(new URL(incoming.url).searchParams.get("offset"));
+      return Response.json({
+        services: inventory.slice(offset, offset + 100),
+        limit: "100",
+        offset: String(offset),
+        count: "101",
+        has_next: offset === 0,
+      });
+    });
+
+    const services = await client.listServices(serviceName);
+
+    expect(services.map((entry) => entry.id)).toEqual(inventory.map((entry) => entry.id));
+    expect(
+      requests.map((request) => Object.fromEntries(new URL(request.url).searchParams)),
+    ).toEqual([
+      {
+        app_id: baseEnv.CRABBOX_KOYEB_APP_ID,
+        types: "SANDBOX",
+        name: serviceName,
+        limit: "100",
+        offset: "0",
+      },
+      {
+        app_id: baseEnv.CRABBOX_KOYEB_APP_ID,
+        types: "SANDBOX",
+        name: serviceName,
+        limit: "100",
+        offset: "100",
+      },
+    ]);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
+  it("uses the total count and consumed items to advance through short pages", async () => {
+    const inventory = inventoryServices(3);
+    const offsets: string[] = [];
+    const client = new KoyebClient(baseEnv, async (request) => {
+      const incoming = request instanceof Request ? request : new Request(request);
+      const offset = new URL(incoming.url).searchParams.get("offset")!;
+      offsets.push(offset);
+      return Response.json({
+        services: inventory.slice(Number(offset), Number(offset) + 1),
+        ...(offset === "0" ? { limit: 100, count: 3 } : {}),
+      });
+    });
+
+    await expect(client.listServices()).resolves.toHaveLength(3);
+    expect(offsets).toEqual(["0", "1", "2"]);
+  });
+
+  it.each([0, 1])(
+    "probes beyond a full page with omitted metadata and %i remaining services",
+    async (remaining) => {
+      const inventory = inventoryServices(100 + remaining);
+      const fetcher = vi.fn<typeof fetch>(async (request) => {
+        const incoming = request instanceof Request ? request : new Request(request);
+        const offset = Number(new URL(incoming.url).searchParams.get("offset"));
+        return Response.json({ services: inventory.slice(offset, offset + 100) });
+      });
+
+      await expect(new KoyebClient(baseEnv, fetcher).listServices()).resolves.toHaveLength(
+        100 + remaining,
+      );
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("accepts a short terminal page with omitted default metadata", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ services: [service()] }));
+
+    await expect(new KoyebClient(baseEnv, fetcher).listServices()).resolves.toHaveLength(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a later page failure without returning a partial inventory", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ services: [service()], has_next: true }))
+      .mockResolvedValueOnce(new Response("provider unavailable", { status: 503 }));
+
+    await expect(new KoyebClient(baseEnv, fetcher).listServices()).rejects.toMatchObject({
+      name: "KoyebHTTPError",
+      status: 503,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["non-boolean continuation", { has_next: "false" }],
+    ["null continuation", { has_next: null }],
+    ["negative count", { count: -1 }],
+    ["fractional count", { count: 1.5 }],
+    ["unsafe count", { count: "9007199254740992" }],
+    ["malformed count", { count: "1oops" }],
+    ["null count", { count: null }],
+    ["count below the page size", { count: 0 }],
+    ["continuation after the count is exhausted", { count: 1, has_next: true }],
+    ["premature terminal flag", { count: 2, has_next: false }],
+    ["wrong offset", { offset: 1 }],
+    ["malformed offset", { offset: "0oops" }],
+    ["zero limit", { limit: 0 }],
+    ["limit above the request", { limit: 101 }],
+    ["malformed limit", { limit: false }],
+    ["missing services", { services: undefined }],
+    ["non-array services", { services: {} }],
+    ["invalid service identity", { services: [service({ id: "invalid" })] }],
+  ])("rejects malformed inventory metadata: %s", async (_name, metadata) => {
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({ services: [service()], ...metadata }),
+    );
+
+    await expect(new KoyebClient(baseEnv, fetcher).listServices()).rejects.toThrow(
+      "koyeb service inventory",
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["continuation", { has_next: true }],
+    ["remaining count", { count: 1 }],
+  ])("rejects an empty page claiming more results through %s", async (_name, metadata) => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ services: [], ...metadata }));
+
+    await expect(new KoyebClient(baseEnv, fetcher).listServices()).rejects.toThrow(
+      "koyeb service inventory",
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["a repeated service", { services: [service()], has_next: false }],
+    ["a repeated offset", { services: inventoryServices(1), offset: 0, has_next: false }],
+    ["a changing count", { services: inventoryServices(1), count: 3, has_next: true }],
+    ["an empty continuing page", { services: [], has_next: true }],
+  ])("rejects %s on a later page", async (_name, page) => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ services: [service()], count: 2, has_next: true }))
+      .mockResolvedValueOnce(Response.json(page));
+
+    await expect(new KoyebClient(baseEnv, fetcher).listServices()).rejects.toThrow(
+      "koyeb service inventory",
+    );
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects repeated service IDs within one page", async () => {
+    const client = new KoyebClient(baseEnv, async () =>
+      Response.json({ services: [service(), service()], has_next: false }),
+    );
+
+    await expect(client.listServices()).rejects.toThrow("koyeb service inventory");
+  });
+});
 
 describe("Koyeb Sandbox coordinator adapter", () => {
   it("rejects private mesh when the coordinator is not in the configured Koyeb app", async () => {
@@ -520,6 +692,45 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       state: { action: "observe", serviceID },
     });
     expect(posts).toBe(1);
+  });
+
+  it("blocks named discovery when another service on a later page has the same lease name", async () => {
+    const requests: Request[] = [];
+    let providerSecret = "";
+    const capability = new KoyebResumableProvisioning(baseEnv, async (request) => {
+      const incoming = request instanceof Request ? request : new Request(request);
+      requests.push(incoming);
+      const url = new URL(incoming.url);
+      if (incoming.method === "GET" && url.pathname === "/v1/services") {
+        const offset = Number(url.searchParams.get("offset"));
+        return Response.json({
+          services: [service(offset === 0 ? {} : { id: latestDeploymentID })],
+          count: 2,
+          offset,
+        });
+      }
+      if (incoming.method === "GET" && url.pathname === `/v1/deployments/${deploymentID}`) {
+        return Response.json({ deployment: deployment(providerSecret) });
+      }
+      throw new Error(`unexpected request ${incoming.method} ${incoming.url}`);
+    });
+    const prepared = await capability.prepare(config(), lease());
+    providerSecret = prepared.material.providerSecret;
+
+    await expect(
+      capability.advance(advanceInput(prepared, prepared.step, false)),
+    ).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "identity_resolution_required",
+    });
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["GET", "/v1/services"],
+      ["GET", "/v1/services"],
+    ]);
+    expect(requests.map((request) => new URL(request.url).searchParams.get("name"))).toEqual([
+      serviceName,
+      serviceName,
+    ]);
   });
 
   it("accepts semantically empty Koyeb response normalization while recovering", async () => {
@@ -1469,7 +1680,7 @@ describe("Koyeb Fleet integration", () => {
     });
   });
 
-  it("includes owned Koyeb sandboxes in the provider pool", async () => {
+  it("includes owned Koyeb sandboxes beyond the first inventory page in the provider pool", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -1477,7 +1688,21 @@ describe("Koyeb Fleet integration", () => {
           requestInput instanceof Request ? requestInput : new Request(requestInput, init);
         const url = new URL(incoming.url);
         if (url.pathname === "/v1/services") {
-          return Response.json({ services: [service()], has_next: false });
+          const offset = Number(url.searchParams.get("offset"));
+          return Response.json({
+            services:
+              offset === 0
+                ? inventoryServices(100).map((entry) => ({
+                    ...entry,
+                    active_deployment_id: "",
+                    latest_deployment_id: "",
+                  }))
+                : [service()],
+            count: 101,
+            offset,
+            limit: 100,
+            has_next: offset === 0,
+          });
         }
         if (url.pathname === `/v1/deployments/${deploymentID}`) {
           return Response.json({ deployment: deployment("u".repeat(32)) });

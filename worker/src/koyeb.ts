@@ -183,14 +183,72 @@ export class KoyebClient {
   }
 
   async listServices(name?: string): Promise<KoyebService[]> {
-    const query = new URLSearchParams({ app_id: this.appID, limit: "100" });
+    const limit = 100;
+    const query = new URLSearchParams({ app_id: this.appID, limit: String(limit) });
     query.append("types", "SANDBOX");
     if (name) query.set("name", name);
-    const value = asObject(await this.apiRequest("GET", `/v1/services?${query.toString()}`));
-    if (value["has_next"] === true) throw new Error("koyeb service inventory is truncated");
-    const services = value["services"];
-    if (!Array.isArray(services)) throw new Error("koyeb service inventory is malformed");
-    return services.map(koyebService);
+    const inventory: KoyebService[] = [];
+    const seen = new Set<string>();
+    let offset = 0;
+    let count: number | undefined;
+    for (;;) {
+      query.set("offset", String(offset));
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Each offset depends on the validated preceding page.
+      const value = asObject(await this.apiRequest("GET", `/v1/services?${query.toString()}`));
+      const services = value["services"];
+      if (!Array.isArray(services)) throw new Error("koyeb service inventory is malformed");
+      const pageLimit = inventoryInteger(value, "limit") ?? limit;
+      const pageOffset = inventoryInteger(value, "offset");
+      const pageCount = inventoryInteger(value, "count");
+      const hasNext = value["has_next"];
+      if (
+        (hasNext !== undefined && typeof hasNext !== "boolean") ||
+        pageLimit === 0 ||
+        pageLimit > limit ||
+        services.length > pageLimit ||
+        (pageOffset !== undefined && pageOffset !== offset) ||
+        (pageCount !== undefined && count !== undefined && pageCount !== count)
+      ) {
+        throw new Error("koyeb service inventory pagination is malformed");
+      }
+      count = pageCount ?? count;
+      // Advance over raw provider rows, before ownership filtering by callers.
+      const nextOffset = offset + services.length;
+      if (
+        !Number.isSafeInteger(nextOffset) ||
+        (count !== undefined &&
+          (count < nextOffset ||
+            (hasNext === true && count === nextOffset) ||
+            (hasNext === false && count > nextOffset)))
+      ) {
+        throw new Error("koyeb service inventory pagination is inconsistent");
+      }
+      // An omitted false has_next/count is common. Probe past a full page when
+      // neither field establishes completion, rather than truncating silently.
+      const more =
+        hasNext ?? (count !== undefined ? nextOffset < count : services.length === pageLimit);
+      if (more && nextOffset <= offset) {
+        throw new Error("koyeb service inventory pagination made no progress");
+      }
+      for (const entry of services) {
+        const service = koyebService(entry);
+        if (
+          !uuidPattern.test(service.id) ||
+          !uuidPattern.test(service.organizationID) ||
+          !uuidPattern.test(service.appID) ||
+          !service.name ||
+          !service.type
+        ) {
+          throw new Error("koyeb service inventory is malformed");
+        }
+        const id = service.id.toLowerCase();
+        if (seen.has(id)) throw new Error("koyeb service inventory contains repeated service IDs");
+        seen.add(id);
+        inventory.push(service);
+      }
+      if (!more) return inventory;
+      offset = nextOffset;
+    }
   }
 
   async listCrabboxServers(): Promise<ProviderMachine[]> {
@@ -1656,6 +1714,19 @@ function inventoryMachine(
     return undefined;
   }
   return machineForService(service, plan, "");
+}
+
+function inventoryInteger(
+  value: JSONRecord,
+  field: "limit" | "offset" | "count",
+): number | undefined {
+  const raw = value[field];
+  if (raw === undefined) return undefined;
+  const parsed = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : raw;
+  if (typeof parsed !== "number" || !Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`koyeb service inventory ${field} is malformed`);
+  }
+  return parsed;
 }
 
 function koyebService(value: unknown): KoyebService {

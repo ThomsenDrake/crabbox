@@ -381,6 +381,7 @@ import type {
   FixedLeaseCreateIntent,
   LeaseRecord,
   ProviderCleanupEvidence,
+  ProviderReleasePending,
   LeaseRegistrationRequest,
   LeaseRequest,
   LeaseShare,
@@ -16819,8 +16820,9 @@ export class FleetCoordinator {
     await Promise.all(
       claims.map(async ({ claim, lease }) => {
         let failure: { error: unknown; message: string } | undefined;
+        let result: void | ProviderReleasePending;
         try {
-          await this.deleteLeaseServer(lease);
+          result = await this.deleteLeaseServer(lease);
         } catch (error) {
           failure = { error, message: coordinatorErrorMessage(this.env, error) };
         }
@@ -16842,6 +16844,11 @@ export class FleetCoordinator {
             console.warn(
               `lease cleanup failed lease=${current.id} provider=${current.provider} cloud=${current.cloudID}: ${failure.message}`,
             );
+            return;
+          }
+          if (result) {
+            recordLeaseCleanupPending(current, result, nowISO);
+            await this.putLease(current);
             return;
           }
           current.state = leaseIsLive(current) ? "expired" : current.state;
@@ -18918,7 +18925,7 @@ export class FleetCoordinator {
     return new HetznerProvider(this.env);
   }
 
-  private async deleteLeaseServer(lease: LeaseRecord): Promise<void> {
+  private async deleteLeaseServer(lease: LeaseRecord): Promise<void | ProviderReleasePending> {
     const provider = managedLeaseProvider(lease);
     if (!provider) {
       return;
@@ -18968,7 +18975,7 @@ export class FleetCoordinator {
         });
       },
     };
-    await this.withLegacyProviderMutation(lease.id, async () => {
+    return this.withLegacyProviderMutation(lease.id, async () => {
       let releaseLease = lease;
       if (
         lease.providerResourceID === undefined &&
@@ -19042,7 +19049,7 @@ export class FleetCoordinator {
         if (!resolvedLease) return;
         releaseLease = resolvedLease;
       }
-      await cloudProvider.releaseLease(releaseLease, context);
+      return cloudProvider.releaseLease(releaseLease, context);
     });
   }
 
@@ -19151,8 +19158,9 @@ export class FleetCoordinator {
         { status: 409 },
       );
     }
+    let cleanupResult: void | ProviderReleasePending;
     try {
-      await this.deleteLeaseServer(preparation.lease);
+      cleanupResult = await this.deleteLeaseServer(preparation.lease);
     } catch (error) {
       const failure = await this.state.runExclusive(async () => {
         const latest = await this.getLease(record.id);
@@ -19208,7 +19216,11 @@ export class FleetCoordinator {
     const latest = await this.state.runExclusive(async () => {
       const current = await this.getLease(record.id);
       if (current && sameLeaseCleanupClaim(current, preparation.lease)) {
-        if (preparation.previous) {
+        if (cleanupResult) {
+          current.expiresAt = new Date().toISOString();
+          recordLeaseCleanupPending(current, cleanupResult, current.expiresAt);
+          await this.putLease(current);
+        } else if (preparation.previous) {
           const completed = applyLeaseRecordChanges(
             current,
             preparation.claimed,
@@ -19465,8 +19477,9 @@ export class FleetCoordinator {
   }): Promise<LeaseRecord> {
     if (await provisioningOwnsLease(this.state.storage, preparation.lease.id))
       return (await this.getLease(preparation.lease.id)) ?? preparation.lease;
+    let cleanupResult: void | ProviderReleasePending;
     try {
-      await this.deleteLeaseServer(preparation.lease);
+      cleanupResult = await this.deleteLeaseServer(preparation.lease);
     } catch (error) {
       await this.withLeaseCleanupState(preparation.lease, async () => {
         const current = await this.getLease(preparation.lease.id);
@@ -19499,6 +19512,12 @@ export class FleetCoordinator {
         (await provisioningOwnsLease(this.state.storage, preparation.lease.id))
       ) {
         return current ?? preparation.lease;
+      }
+      if (cleanupResult) {
+        recordLeaseCleanupPending(current, cleanupResult, new Date().toISOString());
+        await this.putLease(current);
+        await this.scheduleAlarm();
+        return current;
       }
       const released = finalizedReleasedLease(current, true, preparation.keep);
       clearProvisioningRecoveryMetadata(released);
@@ -25383,6 +25402,25 @@ function retainUnresolvedProviderResource(lease: LeaseRecord, message: string, a
   // progress without identity resolution, and elapsed TTL is not observed deletion.
 }
 
+function recordLeaseCleanupPending(
+  lease: LeaseRecord,
+  result: ProviderReleasePending,
+  at: string,
+): void {
+  const nextCheck = Date.parse(result.nextCheckAt);
+  if (result.status !== "pending" || !Number.isFinite(nextCheck)) {
+    throw new Error("provider returned invalid cleanup observation wake");
+  }
+  clearLeaseCleanupCompletion(lease);
+  clearLeaseCleanupMetadata(lease);
+  // Retain a pending claim until the next observation. Existing alarm reconstruction
+  // and public cleanup status already understand this durable representation.
+  // A valid wake may become due while waiting for the state mutex or evidence
+  // persistence. Observe it on the next alarm instead of converting delay to failure.
+  lease.cleanupClaimExpiresAt = new Date(Math.max(nextCheck, Date.parse(at))).toISOString();
+  lease.updatedAt = at;
+}
+
 function recordLeaseCleanupFailure(
   lease: LeaseRecord,
   error: unknown,
@@ -26581,7 +26619,10 @@ interface CloudProvider {
     server: ProviderMachine,
     attempts: ProvisioningAttempt[],
   ): Promise<ProviderLeaseCreateFinalization>;
-  releaseLease(lease: LeaseRecord, context?: ProviderReleaseContext): Promise<void>;
+  releaseLease(
+    lease: LeaseRecord,
+    context?: ProviderReleaseContext,
+  ): Promise<void | ProviderReleasePending>;
   deleteServer(id: string): Promise<void>;
   deleteOwnedServer?(lease: LeaseRecord): Promise<void>;
   inspectCleanup?(lease: LeaseRecord): Promise<unknown>;
@@ -28018,8 +28059,19 @@ export class KoyebProvider implements CloudProvider {
     );
   }
 
-  releaseLease(lease: LeaseRecord): Promise<void> {
-    return this.client.deleteOwnedService(lease);
+  releaseLease(
+    lease: LeaseRecord,
+    context?: ProviderReleaseContext,
+  ): Promise<void | ProviderReleasePending> {
+    if (!context?.assertCleanupOwner || !context.saveCleanupEvidence) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb cleanup requires durable evidence and current ownership",
+      );
+    }
+    return this.client.deleteOwnedService(lease, {
+      assertCleanupOwner: context.assertCleanupOwner,
+      saveCleanupEvidence: context.saveCleanupEvidence,
+    });
   }
 
   deleteServer(id: string): Promise<void> {

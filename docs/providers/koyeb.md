@@ -101,6 +101,22 @@ publishing a private DNS name it cannot reach. See Koyeb's
    deployment, image, environment, route, scaling, and generation still match
    the frozen plan. Active/latest deployment drift blocks deletion.
 
+Active-lease cleanup journals the exact allocation and deletion dispatch before
+calling Koyeb. After Koyeb accepts deletion, an owned service with a recognized
+status remains pending until an observation returns absence or `DELETED`.
+The existing scheduler advances confirmation every two seconds; each invocation
+performs one observation and can resume from the retained journal after a
+coordinator restart. It does not repeat DELETE for a retained dispatch.
+
+The coordinator has an explicit five-minute deletion-confirmation budget,
+independent of CLI and Gateway request deadlines. An exhausted budget, unknown
+dispatch outcome, authentication failure, malformed response, or ownership
+change leaves cleanup unresolved with no automatic retry or success receipt.
+Diagnostic records retain deletion result class, recognized observed status,
+and timestamps; error messages contain bounded stage/HTTP status rather than
+provider response bodies. Inspect the owned resource and retained evidence
+before requesting cleanup again. CLI cleanup observers continue to fail closed.
+
 Scale-to-zero is deliberately disabled. Runner identity lives in ephemeral
 Sandbox state; the default transport also uses a non-reusable enrollment key.
 A deep-sleep restart would strand a published lease. Cost is bounded with hard

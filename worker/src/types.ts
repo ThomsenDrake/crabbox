@@ -471,7 +471,27 @@ export interface HetznerCleanupEvidence {
   };
 }
 
-export type ProviderCleanupEvidence = HetznerCleanupEvidence;
+export interface KoyebCleanupEvidence {
+  version: 1;
+  provider: "koyeb";
+  leaseID: string;
+  serviceID: string;
+  allocationSHA256: string;
+  deploymentID: string;
+  dispatchStartedAt: string;
+  confirmationDeadline: string;
+  deleteAcceptedAt?: string;
+  deleteResult?: "accepted" | "not-found";
+  lastObservation?: { at: string; status: string };
+  confirmation?: { method: "service-absent" | "service-deleted"; at: string };
+}
+
+export type ProviderCleanupEvidence = HetznerCleanupEvidence | KoyebCleanupEvidence;
+
+export interface ProviderReleasePending {
+  status: "pending";
+  nextCheckAt: string;
+}
 
 export interface LeaseRecord {
   id: string;

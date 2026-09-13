@@ -11,9 +11,11 @@ import {
 import { leaseProviderName } from "./slug";
 import type {
   Env,
+  KoyebCleanupEvidence,
   LeaseImageIdentity,
   LeaseRecord,
   ProviderMachine,
+  ProviderReleasePending,
   TailscaleMetadata,
 } from "./types";
 
@@ -26,6 +28,19 @@ const bootstrapCommand = "/usr/local/bin/crabbox-koyeb-bootstrap";
 const workRoot = "/workspace/crabbox";
 const imageKind = "koyeb-sandbox-runner";
 const pollInterval = 2_000;
+// An explicit coordinator observation budget, independent of any CLI/RPC deadline.
+const deletionConfirmationBudgetMs = 5 * 60_000;
+const serviceStatuses = new Set([
+  "STARTING",
+  "HEALTHY",
+  "DEGRADED",
+  "UNHEALTHY",
+  "DELETING",
+  "DELETED",
+  "PAUSING",
+  "PAUSED",
+  "RESUMING",
+]);
 const uuidPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const immutableImagePattern =
   /^(?=.{1,512}$)[a-z0-9][a-z0-9._:-]*(?:\/[a-z0-9][a-z0-9._-]*)+(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[a-f0-9]{64}$/;
@@ -397,13 +412,138 @@ export class KoyebClient {
     return observation.value;
   }
 
-  async deleteOwnedService(lease: LeaseRecord): Promise<void> {
-    const owned = await this.ownedServiceForLease(lease);
-    if (!owned) return;
-    await this.deleteService(owned.service.id);
-    const observed = await this.getService(owned.service.id);
-    if (observed && observed.status !== "DELETED") {
-      throw new Error("Koyeb service deletion is not yet confirmed");
+  async deleteOwnedService(
+    lease: LeaseRecord,
+    context: {
+      assertCleanupOwner: () => Promise<void>;
+      saveCleanupEvidence: (evidence: KoyebCleanupEvidence) => Promise<void>;
+    },
+  ): Promise<void | ProviderReleasePending> {
+    let stage = "identity";
+    try {
+      await context.assertCleanupOwner();
+      const scope = await this.providerScope();
+      if (
+        lease.provider !== "koyeb" ||
+        !uuidPattern.test(lease.cloudID) ||
+        lease.providerScope !== scope ||
+        !lease.createAttemptGeneration
+      ) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb lease cleanup identity is incomplete or belongs to another context",
+        );
+      }
+      const plan = planForLeaseCleanup(this, lease);
+      const allocationSHA256 = await sha256Hex(JSON.stringify([scope, lease.cloudID, plan]));
+      const retained = lease.providerCleanup;
+      if (
+        retained &&
+        (retained.provider !== "koyeb" ||
+          !validKoyebCleanupEvidence(retained, lease, allocationSHA256))
+      ) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb retained cleanup evidence does not match the lease",
+        );
+      }
+      let evidence = retained;
+      const persist = async (next: KoyebCleanupEvidence) => {
+        await context.assertCleanupOwner();
+        const previousStage = stage;
+        stage = "journal";
+        await context.saveCleanupEvidence(next);
+        evidence = next;
+        stage = previousStage;
+      };
+      if (!evidence) {
+        stage = "ownership";
+        const owned = await this.ownedServiceForLease(lease);
+        if (!owned) {
+          await context.assertCleanupOwner();
+          return;
+        }
+        if (owned.service.id !== lease.cloudID || !uuidPattern.test(owned.deployment.id)) {
+          throw new ProviderResourceUnresolvedError(
+            "Koyeb cleanup resource identity does not match the lease",
+          );
+        }
+        if (!serviceStatuses.has(owned.service.status)) {
+          throw new ProviderResourceUnresolvedError("Koyeb service status is unknown");
+        }
+        const now = Date.now();
+        await persist({
+          version: 1,
+          provider: "koyeb",
+          leaseID: lease.id,
+          serviceID: lease.cloudID,
+          allocationSHA256,
+          deploymentID: owned.deployment.id,
+          dispatchStartedAt: new Date(now).toISOString(),
+          confirmationDeadline: new Date(now + deletionConfirmationBudgetMs).toISOString(),
+        });
+        stage = "delete";
+        const accepted = await this.deleteService(lease.cloudID);
+        await persist({
+          ...evidence!,
+          deleteAcceptedAt: new Date().toISOString(),
+          deleteResult: accepted ? "accepted" : "not-found",
+        });
+      }
+      stage = "confirmation";
+      await context.assertCleanupOwner();
+      const observed = await this.getService(lease.cloudID);
+      await context.assertCleanupOwner();
+      if (
+        observed &&
+        (observed.id !== lease.cloudID ||
+          !serviceMatchesPlan(observed, plan) ||
+          (observed.activeDeploymentID && observed.activeDeploymentID !== evidence!.deploymentID) ||
+          (observed.latestDeploymentID && observed.latestDeploymentID !== evidence!.deploymentID))
+      ) {
+        throw new ProviderResourceUnresolvedError("Koyeb cleanup service ownership changed");
+      }
+      if (observed && !serviceStatuses.has(observed.status)) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb cleanup observation has an unknown service status",
+        );
+      }
+      const now = Date.now();
+      const at = new Date(now).toISOString();
+      if (!observed || observed.status === "DELETED") {
+        await persist({
+          ...evidence!,
+          lastObservation: { at, status: observed?.status ?? "ABSENT" },
+          confirmation: { at, method: observed ? "service-deleted" : "service-absent" },
+        });
+        return;
+      }
+      if (!evidence!.deleteAcceptedAt) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb deletion dispatch outcome is unresolved; deletion was not repeated",
+        );
+      }
+      if (evidence!.deleteResult !== "accepted" || evidence!.confirmation) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb cleanup absence evidence conflicts with a present service",
+        );
+      }
+      if (now >= Date.parse(evidence!.confirmationDeadline)) {
+        throw new ProviderResourceUnresolvedError(
+          `Koyeb deletion confirmation deadline exhausted; service status=${observed.status}`,
+        );
+      }
+      await persist({ ...evidence!, lastObservation: { at, status: observed.status } });
+      return {
+        status: "pending",
+        nextCheckAt: new Date(
+          Math.min(now + pollInterval, Date.parse(evidence!.confirmationDeadline)),
+        ).toISOString(),
+      };
+    } catch (error) {
+      if (error instanceof ProviderResourceUnresolvedError) throw error;
+      // Unknown/auth/transport/malformed failures are terminal, never successful deletion or pending.
+      throw new ProviderResourceUnresolvedError(
+        `Koyeb cleanup failed stage=${stage}${error instanceof KoyebHTTPError ? ` http=${error.status}` : ""}`,
+      );
     }
   }
 
@@ -492,6 +632,37 @@ export class KoyebClient {
       throw new KoyebHTTPError(method, path, response.status, "invalid JSON response");
     }
   }
+}
+
+function validKoyebCleanupEvidence(
+  evidence: KoyebCleanupEvidence,
+  lease: LeaseRecord,
+  allocationSHA256: string,
+): boolean {
+  const startedAt = Date.parse(evidence.dispatchStartedAt);
+  const deadline = Date.parse(evidence.confirmationDeadline);
+  const acceptedAt = Date.parse(evidence.deleteAcceptedAt ?? "");
+  return (
+    evidence.version === 1 &&
+    evidence.leaseID === lease.id &&
+    evidence.serviceID === lease.cloudID &&
+    evidence.allocationSHA256 === allocationSHA256 &&
+    uuidPattern.test(evidence.deploymentID) &&
+    Number.isFinite(startedAt) &&
+    deadline === startedAt + deletionConfirmationBudgetMs &&
+    (evidence.deleteAcceptedAt === undefined
+      ? evidence.deleteResult === undefined
+      : Number.isFinite(acceptedAt) &&
+        acceptedAt >= startedAt &&
+        ["accepted", "not-found"].includes(evidence.deleteResult ?? "")) &&
+    (!evidence.lastObservation ||
+      (Number.isFinite(Date.parse(evidence.lastObservation.at)) &&
+        (evidence.lastObservation.status === "ABSENT" ||
+          serviceStatuses.has(evidence.lastObservation.status)))) &&
+    (!evidence.confirmation ||
+      (Number.isFinite(Date.parse(evidence.confirmation.at)) &&
+        ["service-absent", "service-deleted"].includes(evidence.confirmation.method)))
+  );
 }
 
 function retryableManagementFailure(error: unknown): error is KoyebHTTPError {

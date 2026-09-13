@@ -15,6 +15,11 @@ import { KoyebClient, KoyebResumableProvisioning } from "../src/koyeb";
 import type { ProvisioningStep } from "../src/provider-provisioning";
 import { leaseProviderName } from "../src/slug";
 import type { Env, LeaseRecord } from "../src/types";
+import {
+  installPoolDiagnostic,
+  readPoolDiagnostics,
+  unavailablePoolDiagnostic,
+} from "./fixtures/koyeb-pool-diagnostic";
 
 const execute = promisify(execFile);
 const image = process.env.CRABBOX_TEST_RUNNER_IMAGE;
@@ -57,6 +62,7 @@ it.skipIf(!image)(
     let networkID = "";
     let failure: unknown;
     const cleanupErrors: unknown[] = [];
+    let poolDiagnosticInstalled = false;
     try {
       const key = join(directory, "id_ed25519");
       await execute("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key], {
@@ -313,6 +319,13 @@ it.skipIf(!image)(
         { SANDBOX_SECRET: prepared.material.providerSecret },
       );
       await docker(["start", containerID]);
+      try {
+        await installPoolDiagnostic(docker, containerID);
+        poolDiagnosticInstalled = true;
+      } catch {
+        // Diagnostics are ancillary; preserve every original preflight result.
+        process.stdout.write(JSON.stringify(unavailablePoolDiagnostic()) + "\n");
+      }
       // Source mounts must preserve the packaged client used by its wrapper.
       expect(await docker(["exec", containerID, "/usr/local/bin/tailscale", "version"])).toMatch(
         /^\d+\.\d+\.\d+/,
@@ -638,6 +651,17 @@ it.skipIf(!image)(
       failure = error;
     } finally {
       if (containerID) {
+        if (poolDiagnosticInstalled) {
+          try {
+            // CI tees stdout. Retain categories before the existing cleanup,
+            // without another private-executor request or pool check/claim.
+            for (const record of await readPoolDiagnostics(docker, containerID)) {
+              process.stdout.write(JSON.stringify(record) + "\n");
+            }
+          } catch {
+            process.stdout.write(JSON.stringify(unavailablePoolDiagnostic()) + "\n");
+          }
+        }
         try {
           await removeContainer(containerID);
         } catch (error) {

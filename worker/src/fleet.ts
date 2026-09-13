@@ -24,6 +24,13 @@ import {
   validateProvisioningRecord,
   type LeaseProvisioningOperation,
 } from "./lease-provisioning";
+import {
+  ProjectCheckpointStore,
+  ProjectCheckpointError,
+  projectRecoveryPosition,
+  type ProjectCheckpointIO,
+  type ProjectCheckpointBinding,
+} from "./project-checkpoints";
 import type { ProviderResumableProvisioning } from "./provider-provisioning";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
 import {
@@ -31,6 +38,11 @@ import {
   provisioningMaterialKey,
   sealProvisioningMaterial,
 } from "./provisioning-material";
+import {
+  claimReadyPoolAllocation,
+  ReadyPoolClaimError,
+  type ReadyPoolClaimInput,
+} from "./ready-pool-claims";
 
 const { Client: SSHClientConstructor, utils: sshUtils } = ssh2;
 
@@ -1379,6 +1391,15 @@ export class FleetCoordinator {
       if (parts[0] === "v1" && parts[1] === "checkpoints") {
         return await this.checkpointRoute(request, parts);
       }
+      if (
+        parts[0] === "v1" &&
+        parts[1] === "leases" &&
+        parts[2] &&
+        parts[3] === "project-checkpoint" &&
+        parts.length === 4
+      ) {
+        return await this.projectCheckpointRoute(request, parts[2]);
+      }
       if (method === "POST" && parts.join("/") === "v1/images") {
         return await this.createImage(request);
       }
@@ -1571,6 +1592,9 @@ export class FleetCoordinator {
       }
       return json({ error: "not_found" }, { status: 404 });
     } catch (error) {
+      if (error instanceof ProjectCheckpointError)
+        return json({ error: error.code, state: "blocked" }, { status: 409 });
+      if (error instanceof ReadyPoolClaimError) return json({ error: error.code }, { status: 409 });
       return json({ error: coordinatorErrorMessage(this.env, error) }, { status: 500 });
     }
   }
@@ -7657,7 +7681,33 @@ export class FleetCoordinator {
           { status: 409 },
         );
       }
-      return structuredClone(await this.applyLeaseHeartbeatState(lease, input));
+      const updated = await this.applyLeaseHeartbeatState(lease, input);
+      if (updated.readyPoolConsumedAt) {
+        const nowMs = Date.now();
+        for (const entry of await this.readyPoolEntries(true)) {
+          if (entry.leaseID !== updated.id || !entry.singleUse || entry.state !== "busy") continue;
+          const deadline = readyPoolBorrowDeadline(entry);
+          if (deadline === undefined || deadline <= nowMs) {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- The lifecycle lock fences each durable borrow update.
+            await this.quarantineReadyPoolEntry(entry, "borrow heartbeat expired", nowMs, true);
+            continue;
+          }
+          // A single-use runner can never be lent again. Its authenticated lease
+          // heartbeat also owns the borrow while preparation or execution continues.
+          // oxlint-disable-next-line eslint/no-await-in-loop -- The lifecycle lock fences each durable borrow update.
+          await this.putReadyPoolEntry(
+            {
+              ...entry,
+              borrowHeartbeatAt: new Date(nowMs).toISOString(),
+              borrowExpiresAt: new Date(nowMs + readyPoolBorrowTimeoutMs).toISOString(),
+              expiresAt: updated.expiresAt,
+              updatedAt: updated.updatedAt,
+            },
+            true,
+          );
+        }
+      }
+      return structuredClone(updated);
     });
     if (committed instanceof Response) {
       return committed;
@@ -7849,6 +7899,99 @@ export class FleetCoordinator {
       return json({ error: "tailscale_unavailable", message }, { status: 502 });
     }
     return undefined;
+  }
+
+  private projectCheckpointStore(lease: LeaseRecord): ProjectCheckpointStore {
+    if (this.env.CRABBOX_PROJECT_CHECKPOINTS_ENABLED !== "true")
+      throw new ProjectCheckpointError("checkpoint_storage_unconfigured");
+    const provider = this.provider(managedLeaseProvider(lease)!);
+    const io = provider.projectCheckpointIO?.();
+    if (!io) throw new ProjectCheckpointError("checkpoint_provider_unsupported");
+    let allowedRoots: unknown;
+    try {
+      allowedRoots = JSON.parse(this.env.CRABBOX_PROJECT_CHECKPOINT_ROOTS ?? "[]");
+    } catch {
+      allowedRoots = undefined;
+    }
+    if (!Array.isArray(allowedRoots) || !allowedRoots.every((root) => typeof root === "string"))
+      throw new ProjectCheckpointError("checkpoint_storage_unconfigured");
+    let previousKeys: unknown;
+    try {
+      previousKeys = JSON.parse(this.env.CRABBOX_PROJECT_CHECKPOINT_PREVIOUS_KEYS ?? "{}");
+    } catch {
+      previousKeys = undefined;
+    }
+    if (
+      !previousKeys ||
+      typeof previousKeys !== "object" ||
+      Array.isArray(previousKeys) ||
+      !Object.values(previousKeys).every((secret) => typeof secret === "string")
+    )
+      throw new ProjectCheckpointError("checkpoint_storage_unconfigured");
+    return new ProjectCheckpointStore(
+      this.state.storage,
+      {
+        target: this.env.CRABBOX_PROJECT_CHECKPOINT_TARGET ?? "",
+        authority: this.env.CRABBOX_PROJECT_CHECKPOINT_AUTHORITY ?? "",
+        keyID: this.env.CRABBOX_PROJECT_CHECKPOINT_KEY_ID ?? "",
+        secret: this.env.CRABBOX_SESSION_SECRET ?? "",
+        allowedRoots,
+        previousKeys: previousKeys as Record<string, string>,
+      },
+      io,
+    );
+  }
+
+  private async projectCheckpointRoute(request: Request, leaseID: string): Promise<Response> {
+    const lease = await this.resolveLease(leaseID, request, isAdminRequest(request));
+    if (!lease) return notFound();
+    if (lease.owner !== requestOwner(request) && !isAdminRequest(request))
+      return json({ error: "forbidden" }, { status: 403 });
+    try {
+      if (request.method === "GET" && !lease.projectCheckpointKey)
+        return json({ state: "unbound", recovery: "accepted-gateway-files-only" });
+      const store = this.projectCheckpointStore(lease);
+      if (request.method === "GET") {
+        if (!lease.projectCheckpointKey)
+          return json({ state: "unbound", recovery: "accepted-gateway-files-only" });
+        const binding = await store.status(lease, lease.projectCheckpointGeneration!);
+        return json({ binding, recovery: projectRecoveryPosition(binding) });
+      }
+      if (request.method !== "POST") return notFound();
+      const input = await readJson<Record<string, unknown>>(request);
+      let binding;
+      if (input["action"] === "bind") {
+        binding = await this.state.runExclusive(() =>
+          store.bind(lease, input as unknown as Parameters<ProjectCheckpointStore["bind"]>[1]),
+        );
+      } else {
+        const generation = input["generation"];
+        if (!Number.isSafeInteger(generation) || Number(generation) < 1)
+          throw new ProjectCheckpointError("checkpoint_generation_required");
+        if (input["action"] === "capture") {
+          binding = await store.capture(
+            lease,
+            Number(generation),
+            input["acceptedRevision"] as string,
+          );
+        } else if (input["action"] === "restore") {
+          return json(await store.restore(lease, Number(generation)));
+        } else if (input["action"] === "discard" && input["confirmDiscard"] === true) {
+          binding = await store.recordLoss(lease, Number(generation), "discard");
+        } else if (input["action"] === "record-loss" && input["kind"] === "ttl") {
+          binding = await store.recordLoss(lease, Number(generation), "ttl");
+        } else if (input["action"] === "record-loss" && input["kind"] === "crash") {
+          const provider = this.provider(managedLeaseProvider(lease)!);
+          if (!(await provider.projectCheckpointLeaseMissing?.(lease)))
+            throw new ProjectCheckpointError("checkpoint_crash_unproven");
+          binding = await store.recordLoss(lease, Number(generation), "crash");
+        } else throw new ProjectCheckpointError("invalid_checkpoint_action");
+      }
+      return json({ binding, recovery: projectRecoveryPosition(binding) });
+    } catch (error) {
+      if (!(error instanceof ProjectCheckpointError)) throw error;
+      return json({ error: error.code, state: "blocked" }, { status: 409 });
+    }
   }
 
   private async releaseLease(request: Request, leaseID: string, admin: boolean): Promise<Response> {
@@ -12665,6 +12808,13 @@ export class FleetCoordinator {
     if (method === "POST" && action === "borrow-identity") {
       return await this.borrowReadyPoolLease(request, key, true);
     }
+    if (method === "POST" && action === "claim-identity") {
+      return await this.claimSingleUseReadyPool(
+        request,
+        key,
+        await readJson<ReadyPoolClaimInput>(request),
+      );
+    }
     if (method === "POST" && action === "heartbeat") {
       return await this.heartbeatReadyPoolBorrow(request, key);
     }
@@ -12839,11 +12989,30 @@ export class FleetCoordinator {
     if (resolvedLease.state !== "active" || Date.parse(resolvedLease.expiresAt) <= Date.now()) {
       return json({ error: "lease_not_active" }, { status: 409 });
     }
+    const poolProvider = this.provider(managedLeaseProvider(resolvedLease)!);
+    if (
+      poolProvider.readyPoolSingleUse &&
+      (!typed ||
+        resolvedLease.readyPoolConsumedAt ||
+        input.repo ||
+        input.ref ||
+        input.commit ||
+        resolvedLease.owner !== requestOwner(request))
+    ) {
+      return json({ error: "pool_clean_typed_lease_required" }, { status: 409 });
+    }
     let checkedLease = resolvedLease;
     if (typed) {
       const observed = await this.observeReadyPoolLeaseImageIdentity(resolvedLease, request);
       if (observed instanceof Response) return observed;
       checkedLease = observed;
+    }
+    if (poolProvider.prepareReadyPoolLease) {
+      try {
+        await poolProvider.prepareReadyPoolLease(checkedLease);
+      } catch {
+        return json({ error: "pool_clean_proof_failed" }, { status: 409 });
+      }
     }
     if (typed && !this.readyPoolIdentityMatchesLease(input.identity!, checkedLease)) {
       return json(
@@ -12866,6 +13035,9 @@ export class FleetCoordinator {
         }
         if (lease.state !== "active" || Date.parse(lease.expiresAt) <= Date.now()) {
           return json({ error: "lease_not_active" }, { status: 409 });
+        }
+        if (poolProvider.readyPoolSingleUse && lease.readyPoolConsumedAt) {
+          return json({ error: "pool_lease_consumed" }, { status: 409 });
         }
         if (typed && !sameReadyPoolObservationLease(lease, checkedLease)) {
           return json(
@@ -12964,6 +13136,7 @@ export class FleetCoordinator {
         addReadyPoolEntryString(entry, "sshPort", readyPoolLeaseSSHPort(lease, input.sshPort));
         addReadyPoolEntryString(entry, "workRoot", readyPoolLeaseWorkRoot(lease, input.workRoot));
         if (typed) entry.identity = input.identity!;
+        if (poolProvider.readyPoolSingleUse) entry.singleUse = true;
         if (lease.windowsMode) {
           entry.windowsMode = lease.windowsMode;
         }
@@ -12978,10 +13151,36 @@ export class FleetCoordinator {
         }
         await Promise.all(
           existingPoolEntries
-            .filter((existing) => existing.key !== key || Boolean(existing.identity) !== typed)
+            .filter(
+              (existing) =>
+                !poolProvider.readyPoolSingleUse &&
+                (existing.key !== key || Boolean(existing.identity) !== typed),
+            )
             .map((existing) => this.deleteReadyPoolEntry(existing, Boolean(existing.identity))),
         );
-        await this.putReadyPoolEntry(entry, typed);
+        if (poolProvider.readyPoolSingleUse) {
+          await this.state.storage.transaction(async (transaction) => {
+            const latest = await transaction.get<LeaseRecord>(leaseKey(lease.id));
+            const existing = [
+              ...(
+                await transaction.list<ReadyPoolEntry>({ prefix: typedReadyPoolPrefix })
+              ).values(),
+              ...(await transaction.list<ReadyPoolEntry>({ prefix: readyPoolPrefix })).values(),
+            ].filter((candidate) => candidate.leaseID === lease.id);
+            if (
+              !latest ||
+              !sameReadyPoolObservationLease(latest, lease) ||
+              latest.readyPoolConsumedAt ||
+              existing.some(
+                (candidate) =>
+                  candidate.state !== "ready" || candidate.key !== key || !candidate.singleUse,
+              )
+            ) {
+              throw new ReadyPoolClaimError("pool_registration_fenced");
+            }
+            await transaction.put(readyPoolKey(key, lease.id, true), entry);
+          });
+        } else await this.putReadyPoolEntry(entry, typed);
         if (fillClaim) {
           await this.state.storage.delete(readyPoolFillClaimKey(fillClaim.token, typed));
           await this.incrementReadyPoolCounters(request, key, { fillClaimsCompleted: 1 }, typed);
@@ -13004,6 +13203,12 @@ export class FleetCoordinator {
     if (providerError) return providerError;
     const seedError = await readyPoolSeedIdentityRequestError(input.identity, input);
     if (seedError) return seedError;
+    if (typed && this.provider(input.identity!.image.provider as Provider).readyPoolSingleUse) {
+      return this.claimSingleUseReadyPool(request, key, {
+        identity: input.identity!,
+        operationID: crypto.randomUUID(),
+      });
+    }
     const compatibilityKey = normalizeReadyPoolCompatibilityKey(input.compatibilityKey);
     if (input.compatibilityKey !== undefined && !compatibilityKey) {
       return json({ error: "invalid_compatibility_key" }, { status: 400 });
@@ -13100,6 +13305,48 @@ export class FleetCoordinator {
         });
       });
     });
+  }
+
+  private async claimSingleUseReadyPool(
+    request: Request,
+    key: string,
+    input: ReadyPoolClaimInput,
+  ): Promise<Response> {
+    const identityError = readyPoolIdentityRequestError(input.identity, true);
+    if (identityError) return identityError;
+    if (!isCoordinatorProvider(input.identity.image.provider))
+      return json({ error: "invalid_provider" }, { status: 400 });
+    const provider = this.provider(input.identity.image.provider);
+    if (
+      !provider.readyPoolSingleUse ||
+      !provider.claimReadyPoolLease ||
+      !provider.supportsReadyPoolImageIdentity?.(input.identity.image)
+    ) {
+      return json({ error: "unsupported_pool_claim_identity" }, { status: 409 });
+    }
+    try {
+      const result = await claimReadyPoolAllocation({
+        storage: this.state.storage,
+        poolKey: key,
+        input,
+        exclusive: (operation) => this.state.runExclusive(operation),
+        principal: { owner: requestOwner(request), org: requestOrg(request, this.env) },
+        matches: (lease) => this.readyPoolIdentityMatchesLease(input.identity, lease),
+        claim: (lease, token) => provider.claimReadyPoolLease!(lease, token),
+      });
+      await this.state.runExclusive(() => this.scheduleAlarm());
+      return json({
+        allocation: result.allocation,
+        ...(result.entry ? { entry: publicReadyPoolEntry(result.entry) } : {}),
+        ...(result.lease ? { lease: publicLeaseRecord(result.lease) } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof ReadyPoolClaimError)) throw error;
+      return json(
+        { error: error.code, ...(error.allocation ? { allocation: error.allocation } : {}) },
+        { status: 409 },
+      );
+    }
   }
 
   private async heartbeatReadyPoolBorrow(
@@ -13324,7 +13571,13 @@ export class FleetCoordinator {
             readyPoolCriteriaEqual(claim.criteria, criteria),
         );
         const counts = readyPoolCapacityCounts(entries, claims.length);
-        const activeCapacity = counts.ready + counts.busy + counts.inFlight;
+        // Consumed single-use runners never return to idle inventory. Their
+        // active leases must not prevent preparation of replacement runners.
+        const reusableBusy =
+          typed && this.provider(input.identity!.image.provider as Provider).readyPoolSingleUse
+            ? 0
+            : counts.busy;
+        const activeCapacity = counts.ready + reusableBusy + counts.inFlight;
         let claim: ReadyPoolFillClaim | undefined;
         if (input.claim === true && counts.ready < minReady && activeCapacity < maxReady) {
           claim = {
@@ -13357,7 +13610,7 @@ export class FleetCoordinator {
           satisfied: counts.ready >= minReady,
           reconciling: counts.ready + counts.inFlight >= minReady,
           capped:
-            counts.ready < minReady && counts.ready + counts.busy + counts.inFlight >= maxReady,
+            counts.ready < minReady && counts.ready + reusableBusy + counts.inFlight >= maxReady,
           claim: claim
             ? {
                 token: claim.token,
@@ -13441,6 +13694,9 @@ export class FleetCoordinator {
     if (!validLeaseID(leaseID)) {
       return json({ error: "invalid_lease_id" }, { status: 400 });
     }
+    if (typed && (await this.getReadyPoolEntry(key, leaseID, true))?.singleUse) {
+      return this.retireSingleUseReadyPool(request, key, input);
+    }
     return await this.withReadyPoolBorrowLock(async () => {
       const current = await this.getReadyPoolEntry(key, leaseID, typed);
       if (!current) {
@@ -13503,6 +13759,16 @@ export class FleetCoordinator {
           {
             error: "pool_entry_quarantined",
             message: "quarantined or stale pool entries must be drained or released",
+          },
+          { status: 409 },
+        );
+      }
+      if (current.singleUse && result === "ready") {
+        // Retirement is explicit. A mistaken ready return neither reuses nor deletes project work.
+        return json(
+          {
+            error: "pool_retirement_required",
+            message: "single-use pool leases must checkpoint and retire",
           },
           { status: 409 },
         );
@@ -13572,6 +13838,50 @@ export class FleetCoordinator {
         lease: publicLeaseRecord(lease),
       });
     });
+  }
+
+  private async retireSingleUseReadyPool(
+    request: Request,
+    key: string,
+    input: ReadyPoolReturnRequest,
+  ): Promise<Response> {
+    if (input.result !== "drain" && input.result !== "release")
+      return json({ error: "pool_retirement_required" }, { status: 409 });
+    const lease = await this.getLease(input.leaseID!);
+    if (!lease || !this.leaseManageableByRequest(lease, request, isAdminRequest(request)))
+      return notFound();
+    const drained = await this.state.runExclusive(() =>
+      this.state.storage.transaction(async (transaction) => {
+        const current = await transaction.get<ReadyPoolEntry>(readyPoolKey(key, lease.id, true));
+        if (!current?.singleUse) return undefined;
+        if (current.state === "busy" && current.borrowToken !== input.borrowToken) return undefined;
+        const next = this.nextReturnedReadyPoolEntry(
+          current,
+          lease,
+          "draining",
+          "single-use-retirement",
+        );
+        await transaction.put(readyPoolKey(key, lease.id, true), next);
+        return next;
+      }),
+    );
+    if (!drained) return json({ error: "pool_retirement_fenced" }, { status: 409 });
+    // Checkpoint/DELETE runs outside the global pool borrow lock, so unrelated claims progress.
+    try {
+      const released = await this.releaseResolvedLease(lease, {
+        deleteServer: true,
+        keep: false,
+        expectedLease: lease,
+        awaitProviderCleanup: true,
+      });
+      return json({ entry: publicReadyPoolEntry(drained), lease: publicLeaseRecord(released) });
+    } catch (error) {
+      if (!(error instanceof ProjectCheckpointError)) throw error;
+      return json(
+        { error: error.code, state: "blocked", entry: publicReadyPoolEntry(drained) },
+        { status: 409 },
+      );
+    }
   }
 
   private nextReturnedReadyPoolEntry(
@@ -16758,6 +17068,20 @@ export class FleetCoordinator {
         if (!needsCleanup) {
           return;
         }
+        if (stored.projectCheckpointKey) {
+          try {
+            const store = this.projectCheckpointStore(stored);
+            const binding = await store.status(stored, stored.projectCheckpointGeneration!);
+            if (binding.state !== "lost" && binding.state !== "reclaim-ready") {
+              // An elapsed lease deadline is unavoidable loss, not successful checkpointing.
+              if (Date.parse(stored.expiresAt) > now) return;
+              await store.recordLoss(stored, stored.projectCheckpointGeneration!, "ttl");
+            }
+          } catch {
+            // An unconfigured or unreadable bound checkpoint must not authorize deletion.
+            return;
+          }
+        }
         const lease = structuredClone(stored);
         const claimExpiresAt = cleanupClaimDeadline(lease);
         if (lease.cleanupStartedAt && claimExpiresAt > now) {
@@ -18926,6 +19250,14 @@ export class FleetCoordinator {
   }
 
   private async deleteLeaseServer(lease: LeaseRecord): Promise<void | ProviderReleasePending> {
+    if (lease.projectCheckpointKey) {
+      const binding = await this.projectCheckpointStore(lease).status(
+        lease,
+        lease.projectCheckpointGeneration!,
+      );
+      if (binding.state !== "lost" && binding.state !== "reclaim-ready")
+        throw new ProjectCheckpointError("checkpoint_required_reclaim_held");
+    }
     const provider = managedLeaseProvider(lease);
     if (!provider) {
       return;
@@ -19285,10 +19617,27 @@ export class FleetCoordinator {
     ) {
       return current;
     }
+    // Fail before lifecycle mutation or provider DELETE. A bound checkpoint is never optional.
+    if (current.projectCheckpointKey)
+      await this.projectCheckpointStore(current).beforeReclaim(current);
     if (this.state.provisioning) {
       const released = await this.state.provisioning.commitAndWake(async (transaction) => {
         const latest = await transaction.get<LeaseRecord>(leaseKey(current.id));
         if (!latest || !sameLeaseReleaseIdentity(latest, current)) return undefined;
+        if (latest.projectCheckpointKey) {
+          const checkpoint = await transaction.get<ProjectCheckpointBinding>(
+            latest.projectCheckpointKey,
+          );
+          if (
+            !checkpoint ||
+            checkpoint.generation !== latest.projectCheckpointGeneration ||
+            checkpoint.leaseID !== latest.id ||
+            checkpoint.leaseGeneration !== latest.createAttemptGeneration ||
+            (checkpoint.state !== "reclaim-ready" && checkpoint.state !== "lost")
+          ) {
+            throw new ProjectCheckpointError("checkpoint_required_reclaim_held");
+          }
+        }
         return cancelProvisioningOperation(transaction, latest, Date.now(), options);
       });
       if (released) {
@@ -19372,6 +19721,14 @@ export class FleetCoordinator {
         throw new LeaseReleaseResolutionConflictError();
       }
       const current = stored ?? structuredClone(lease);
+      if (current.projectCheckpointKey) {
+        const checkpoint = await this.projectCheckpointStore(current).status(
+          current,
+          current.projectCheckpointGeneration!,
+        );
+        if (checkpoint.state !== "reclaim-ready" && checkpoint.state !== "lost")
+          throw new ProjectCheckpointError("checkpoint_required_reclaim_held");
+      }
       if (current.runtimeAdapterDeleteRequestedAt) {
         return { cleanup: false as const, blocked: true as const, lease: current };
       }
@@ -21431,6 +21788,8 @@ function sameReadyPoolObservationLease(left: LeaseRecord, right: LeaseRecord): b
     left.lifecycle === right.lifecycle &&
     left.target === right.target &&
     left.architecture === right.architecture &&
+    left.serverType === right.serverType &&
+    left.createAttemptGeneration === right.createAttemptGeneration &&
     left.state === right.state &&
     left.expiresAt === right.expiresAt
   );
@@ -21443,6 +21802,7 @@ function sameLeaseImageIdentity(left: LeaseImageIdentity, right: LeaseImageIdent
     left.provider === right.provider &&
     left.kind === right.kind &&
     left.region === right.region &&
+    left.scope === right.scope &&
     left.promotedAt === right.promotedAt &&
     left.sourceID === right.sourceID
   );
@@ -26561,6 +26921,11 @@ interface CloudProvider {
   readyPoolImageIdentity?(lease: LeaseRecord): ReadyPoolImageIdentity | undefined;
   observeReadyPoolImageIdentity?(lease: LeaseRecord): Promise<LeaseImageIdentity | undefined>;
   supportsReadyPoolImageIdentity?(identity: ReadyPoolImageIdentity): boolean;
+  readyPoolSingleUse?: true;
+  prepareReadyPoolLease?(lease: LeaseRecord): Promise<void>;
+  claimReadyPoolLease?(lease: LeaseRecord, claim: string): Promise<void>;
+  projectCheckpointIO?(): ProjectCheckpointIO;
+  projectCheckpointLeaseMissing?(lease: LeaseRecord): Promise<boolean>;
   listCrabboxServers(): Promise<ProviderMachine[]>;
   listReconciliationResources?(): Promise<ProviderMachine[]>;
   workspaceCapability?(
@@ -28024,6 +28389,7 @@ export class GCPProvider implements CloudProvider {
 
 export class KoyebProvider implements CloudProvider {
   private clientValue?: KoyebClient;
+  readonly readyPoolSingleUse = true;
 
   constructor(
     private readonly env: Env,
@@ -28037,6 +28403,53 @@ export class KoyebProvider implements CloudProvider {
 
   resumableProvisioning(): ProviderResumableProvisioning {
     return new KoyebResumableProvisioning(this.env, this.fetcher);
+  }
+
+  readyPoolImageIdentity(lease: LeaseRecord): ReadyPoolImageIdentity | undefined {
+    return this.client.readyPoolImageIdentity(lease);
+  }
+
+  supportsReadyPoolImageIdentity(identity: ReadyPoolImageIdentity): boolean {
+    return this.client.supportsReadyPoolImageIdentity(identity);
+  }
+
+  observeReadyPoolImageIdentity(lease: LeaseRecord): Promise<LeaseImageIdentity | undefined> {
+    return this.client.observeReadyPoolImageIdentity(lease);
+  }
+
+  prepareReadyPoolLease(lease: LeaseRecord): Promise<void> {
+    return this.client.prepareReadyPoolLease(lease);
+  }
+
+  claimReadyPoolLease(lease: LeaseRecord, claim: string): Promise<void> {
+    return this.client.claimReadyPoolLease(lease, claim);
+  }
+
+  projectCheckpointIO(): ProjectCheckpointIO {
+    return {
+      capture: async (lease, root, allowedRoot, dependencyPolicy) =>
+        JSON.parse(
+          await this.client.runProjectState(lease, {
+            action: "capture",
+            root,
+            allowedRoot,
+            dependencyPolicy,
+          }),
+        ) as unknown,
+      restore: async (lease, root, allowedRoot, snapshot) =>
+        JSON.parse(
+          await this.client.runProjectState(lease, {
+            action: "restore",
+            root,
+            allowedRoot,
+            ...snapshot,
+          }),
+        ) as unknown,
+    };
+  }
+
+  async projectCheckpointLeaseMissing(lease: LeaseRecord): Promise<boolean> {
+    return !(await this.client.ownedServiceForLease(lease));
   }
 
   listCrabboxServers(): Promise<ProviderMachine[]> {

@@ -16,6 +16,33 @@ import (
 
 const wantCoordinatorRequiredError = "provider=koyeb requires a configured coordinator; direct lifecycle is not supported"
 
+func TestReadyPoolKoyebIdentityRejectsResourceAndBootstrapDrift(t *testing.T) {
+	image := core.CoordinatorLeaseImage{Provider: "koyeb", Kind: "koyeb-sandbox-runner", Source: "explicit", Region: "was",
+		ID:    "registry.example/runner@sha256:" + strings.Repeat("a", 64),
+		Scope: "koyeb:33333333-3333-4333-8333-333333333333:44444444-4444-4444-8444-444444444444:was:large:clean-runner-v1"}
+	request := core.ProviderReadyPoolImageIdentityRequest{
+		Identity: core.CoordinatorReadyPoolImageIdentity{Provider: "koyeb", Scope: image.Scope, ID: image.ID},
+		Lease:    core.ProviderReadyPoolLeaseImageIdentity{Provider: "koyeb", Region: "was", ServerType: "large", Image: &image},
+	}
+	if !(Provider{}).ReadyPoolImageIdentityMatchesLease(request) {
+		t.Fatal("complete identity rejected")
+	}
+	for _, mutate := range []func(*core.ProviderReadyPoolImageIdentityRequest){
+		func(r *core.ProviderReadyPoolImageIdentityRequest) { r.Lease.ServerType = "small" },
+		func(r *core.ProviderReadyPoolImageIdentityRequest) { r.Lease.Region = "fra" },
+		func(r *core.ProviderReadyPoolImageIdentityRequest) {
+			r.Identity.Scope = strings.ReplaceAll(r.Identity.Scope, "clean-runner-v1", "clean-runner-v2")
+		},
+		func(r *core.ProviderReadyPoolImageIdentityRequest) { r.Identity.ID = "registry.example/runner:mutable" },
+	} {
+		changed := request
+		mutate(&changed)
+		if (Provider{}).ReadyPoolImageIdentityMatchesLease(changed) {
+			t.Fatal("drifted identity accepted")
+		}
+	}
+}
+
 func TestProviderSpec(t *testing.T) {
 	p := Provider{}
 	if p.Name() != providerName {

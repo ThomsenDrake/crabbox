@@ -1,21 +1,29 @@
 /* oxlint-disable eslint/no-await-in-loop -- Fleet provisioning phases must advance sequentially. */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { sha256Hex } from "../src/auth";
 import { leaseConfig } from "../src/config";
-import { FleetCoordinator, KoyebProvider } from "../src/fleet";
+import { FleetCoordinator, KoyebProvider, readyPoolSeedDigestV1 } from "../src/fleet";
 import { KoyebClient, KoyebHTTPError, KoyebResumableProvisioning } from "../src/koyeb";
 import {
   provisioningOperationKey,
   type LeaseProvisioningOperation,
 } from "../src/lease-provisioning";
 import { orgKeyForLabel } from "../src/org-identity";
+import { ProjectCheckpointError, type ProjectCheckpointIO } from "../src/project-checkpoints";
 import { providerLabelValue } from "../src/provider-labels";
 import {
   ProviderResourceUnresolvedError,
   type ProvisioningStep,
 } from "../src/provider-provisioning";
 import { leaseProviderName } from "../src/slug";
-import type { Env, LeaseRecord, ProviderCleanupEvidence } from "../src/types";
+import type {
+  Env,
+  LeaseRecord,
+  ProviderCleanupEvidence,
+  ReadyPoolEntry,
+  ReadyPoolIdentityV1,
+} from "../src/types";
 import { ProvisioningTestRuntime, ProvisioningTestStorage } from "./provisioning-fixtures";
 
 const serviceID = "11111111-1111-4111-8111-111111111111";
@@ -344,14 +352,17 @@ async function activeCleanupFixture() {
   };
 }
 
-async function activeFleetCleanupFixture() {
+async function activeFleetCleanupFixture(extraEnv: Partial<Env> = {}, io?: ProjectCheckpointIO) {
   const fixture = await activeCleanupFixture();
   fixture.active.org = orgKeyForLabel("example-org");
   const storage = new ProvisioningTestStorage();
   await storage.put(`lease:${fixture.active.id}`, fixture.active);
   const runtime = new ProvisioningTestRuntime(storage);
-  const coordinator = new FleetCoordinator(runtime, fleetEnv, {
-    koyeb: new KoyebProvider(fleetEnv, fixture.fetcher),
+  const environment = { ...fleetEnv, ...extraEnv };
+  const provider = new KoyebProvider(environment, fixture.fetcher);
+  if (io) vi.spyOn(provider, "projectCheckpointIO").mockReturnValue(io);
+  const coordinator = new FleetCoordinator(runtime, environment, {
+    koyeb: provider,
   });
   const release = () =>
     coordinator.fetch(
@@ -368,8 +379,238 @@ async function activeFleetCleanupFixture() {
     );
     return response.json();
   };
-  return { ...fixture, storage, release, tick, publicLease };
+  return { ...fixture, storage, runtime, coordinator, provider, release, tick, publicLease };
 }
+
+const readyScope = `koyeb:${baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID}:${baseEnv.CRABBOX_KOYEB_APP_ID}:was:large:clean-runner-v1`;
+const checkpointRevision = `sha256:${"a".repeat(64)}`;
+const checkpointEnv = {
+  CRABBOX_PROJECT_CHECKPOINTS_ENABLED: "true",
+  CRABBOX_PROJECT_CHECKPOINT_TARGET: "personal",
+  CRABBOX_PROJECT_CHECKPOINT_AUTHORITY: "coordinator-personal",
+  CRABBOX_PROJECT_CHECKPOINT_KEY_ID: "version-1",
+  CRABBOX_PROJECT_CHECKPOINT_ROOTS: '["/workspace"]',
+};
+
+async function projectSnapshot() {
+  const work = "uncommitted synthetic project work";
+  const content = JSON.stringify({
+    schema: "crabbox-project-files/v1",
+    bytes: Buffer.byteLength(work),
+    gitMetadata: "excluded",
+    processState: "not-captured",
+    exclusions: [],
+    entries: [
+      {
+        path: "app.js",
+        type: "file",
+        mode: 0o644,
+        data: Buffer.from(work).toString("base64"),
+        sha256: await sha256Hex(work),
+      },
+    ],
+  });
+  return {
+    schema: "crabbox-project-files/v1",
+    content: Buffer.from(content).toString("base64"),
+    sha256: await sha256Hex(content),
+    bytes: Buffer.byteLength(work),
+    consistency: "stable-tree",
+  };
+}
+
+async function projectFleetFixture() {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+  const io = {
+    capture: vi.fn<typeof projectSnapshot>(projectSnapshot),
+    restore: vi.fn<ProjectCheckpointIO["restore"]>(async () => ({})),
+  };
+  const f = await activeFleetCleanupFixture(checkpointEnv, io);
+  const checkpoint = (action?: Record<string, unknown>) =>
+    f.coordinator.fetch(
+      fleetRequest(action ? "POST" : "GET", `/v1/leases/${f.active.id}/project-checkpoint`, action),
+    );
+  const bound = await checkpoint({
+    action: "bind",
+    target: "personal",
+    authority: "coordinator-personal",
+    projectID: "project-a",
+    sessionID: "session-a",
+    root: "/workspace/project-a",
+    acceptedRevision: checkpointRevision,
+  });
+  expect(bound.status).toBe(200);
+  return { ...f, io, checkpoint };
+}
+
+describe("Koyeb ready pools and checkpoint lifecycle", () => {
+  it("binds pool evidence to immutable image, app, resource size, architecture and bootstrap", async () => {
+    const f = await activeCleanupFixture();
+    f.active.image!.scope = readyScope;
+    const client = new KoyebClient(baseEnv, f.fetcher);
+    const identity = { provider: "koyeb", scope: readyScope, id: runnerImage };
+    expect(client.readyPoolImageIdentity(f.active)).toEqual(identity);
+    expect(client.supportsReadyPoolImageIdentity(identity)).toBe(true);
+    expect(await client.observeReadyPoolImageIdentity(f.active)).toEqual(f.active.image);
+    for (const overrides of [
+      { region: "fra" },
+      { serverType: "small" },
+      { architecture: "arm64" },
+      { image: { ...f.active.image!, sourceID: "different-registry-credential" } },
+      { image: { ...f.active.image!, id: digestOnlyRunnerImage } },
+      {
+        image: {
+          ...f.active.image!,
+          scope: readyScope.replace("clean-runner-v1", "clean-runner-v2"),
+        },
+      },
+      {
+        image: {
+          ...f.active.image!,
+          scope: readyScope.replace(baseEnv.CRABBOX_KOYEB_APP_ID!, deploymentID),
+        },
+      },
+    ])
+      expect(
+        client.readyPoolImageIdentity({ ...f.active, ...overrides } as LeaseRecord),
+      ).toBeUndefined();
+  });
+
+  it("registers and claims once; lease heartbeat keeps the borrow alive and expired borrows quarantine", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+    const f = await activeFleetCleanupFixture();
+    f.active.image!.scope = readyScope;
+    await f.storage.put(`lease:${f.active.id}`, f.active);
+    vi.spyOn(f.provider, "prepareReadyPoolLease").mockResolvedValue();
+    const claim = vi.spyOn(f.provider, "claimReadyPoolLease").mockResolvedValue();
+    const identity: ReadyPoolIdentityV1 = {
+      schema: "crabbox-ready-pool-identity/v1",
+      image: { provider: "koyeb", scope: readyScope, id: runnerImage },
+      architecture: "amd64",
+      seedDigest: await readyPoolSeedDigestV1({}),
+      cacheCompatibility: "clean-node24",
+    };
+    const request = (action: string, body: unknown) =>
+      f.coordinator.fetch(fleetRequest("POST", `/v1/ready-pools/coding/${action}`, body));
+    expect((await request("register-identity", { leaseID: f.active.id, identity })).status).toBe(
+      200,
+    );
+    const input = { operationID: "operation-one", coldLeaseID: "cbx_cold", identity };
+    const selected = await request("claim-identity", { ...input, selectOnly: true });
+    expect(selected.status).toBe(200);
+    expect(await selected.json()).toMatchObject({
+      allocation: { kind: "warm", phase: "selected" },
+    });
+    expect(claim).not.toHaveBeenCalled();
+    expect((await request("claim-identity", input)).status).toBe(200);
+    expect(claim).toHaveBeenCalledOnce();
+    expect((await request("register-identity", { leaseID: f.active.id, identity })).status).toBe(
+      409,
+    );
+    expect(
+      await (
+        await request("claim-identity", {
+          ...input,
+          operationID: "second",
+          coldLeaseID: "cbx_second",
+        })
+      ).json(),
+    ).toMatchObject({ allocation: { kind: "cold", reasonCode: "pool-miss" } });
+    const replenish = { identity, minReady: 1, maxReady: 1, claim: true };
+    const refill = await request("reconcile-identity", replenish);
+    expect(refill.status).toBe(200);
+    expect(await refill.json()).toMatchObject({
+      counts: { ready: 0, busy: 1, inFlight: 1 },
+      claim: { token: expect.any(String) },
+    });
+    const alreadyFilling = await request("reconcile-identity", replenish);
+    expect(alreadyFilling.status).toBe(200);
+    const capacity = await alreadyFilling.json();
+    expect(capacity).toMatchObject({
+      counts: { ready: 0, busy: 1, inFlight: 1 },
+      capped: true,
+    });
+    expect(capacity).not.toHaveProperty("claim");
+    const key = `typed-ready-pool-v1:coding:${f.active.id}`;
+    const before = (await f.storage.get<ReadyPoolEntry>(key))!;
+    vi.setSystemTime(Date.now() + 20_000);
+    const heartbeat = () =>
+      f.coordinator.fetch(fleetRequest("POST", `/v1/leases/${f.active.id}/heartbeat`, {}));
+    expect((await heartbeat()).status).toBe(200);
+    const after = (await f.storage.get<ReadyPoolEntry>(key))!;
+    expect(Date.parse(after.borrowExpiresAt!)).toBeGreaterThan(Date.parse(before.borrowExpiresAt!));
+    expect(
+      (
+        await request("return-identity", {
+          leaseID: f.active.id,
+          borrowToken: after.borrowToken,
+          result: "ready",
+        })
+      ).status,
+    ).toBe(409);
+    await f.storage.put(key, { ...after, borrowExpiresAt: new Date(Date.now() - 1).toISOString() });
+    expect((await heartbeat()).status).toBe(200);
+    expect(await f.storage.get(key)).toMatchObject({ state: "quarantined" });
+  });
+
+  it("holds HTTP ordinary release before lifecycle mutation and DELETE on checkpoint failure", async () => {
+    const f = await projectFleetFixture();
+    f.io.capture.mockRejectedValue(
+      new ProjectCheckpointError("checkpoint_unpreserved_content_limit"),
+    );
+    const held = await f.release();
+    expect(held.status).toBe(409);
+    expect(await held.json()).toMatchObject({
+      error: "checkpoint_unpreserved_content_limit_reclaim_held",
+      state: "blocked",
+    });
+    expect(await f.storage.get(`lease:${f.active.id}`)).toMatchObject({ state: "active" });
+    await f.tick();
+    expect(f.state.deletes).toBe(0);
+    expect(await (await f.checkpoint()).json()).toMatchObject({
+      binding: { state: "blocked", failureCode: "checkpoint_unpreserved_content_limit" },
+    });
+    f.io.capture.mockImplementation(projectSnapshot);
+    expect((await f.release()).status).toBe(200);
+    f.state.observe = () => new Response("not found", { status: 404 });
+    await f.tick();
+    expect(f.state.deletes).toBe(1);
+    expect(await (await f.checkpoint()).json()).toMatchObject({
+      binding: { state: "reclaim-ready" },
+      recovery: { processResume: false },
+    });
+  });
+
+  it("does not conflate explicit discard, unproven crash and automatic elapsed TTL loss", async () => {
+    const f = await projectFleetFixture();
+    expect(
+      (await f.checkpoint({ action: "record-loss", generation: 1, kind: "crash" })).status,
+    ).toBe(409);
+    expect((await f.checkpoint({ action: "discard", generation: 1 })).status).toBe(409);
+    expect((await f.checkpoint({ action: "record-loss", generation: 1, kind: "ttl" })).status).toBe(
+      409,
+    );
+    f.io.capture.mockRejectedValue(new Error("synthetic unpreserved state"));
+    vi.setSystemTime(new Date(f.active.expiresAt).getTime() + 1);
+    await f.tick();
+    expect(await (await f.checkpoint()).json()).toMatchObject({
+      binding: { state: "lost", loss: { kind: "ttl" } },
+    });
+    expect(f.io.capture).not.toHaveBeenCalled();
+    const discarded = await projectFleetFixture();
+    expect(
+      (await discarded.checkpoint({ action: "discard", generation: 1, confirmDiscard: true }))
+        .status,
+    ).toBe(200);
+    expect((await discarded.release()).status).toBe(200);
+    expect(discarded.io.capture).not.toHaveBeenCalled();
+    expect(await (await discarded.checkpoint()).json()).toMatchObject({
+      binding: { loss: { kind: "discard" } },
+    });
+  });
+});
 
 describe("Koyeb active lease deletion confirmation", () => {
   it.each([

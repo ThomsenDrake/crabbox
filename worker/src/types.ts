@@ -10,6 +10,12 @@ export interface AWSCredentials {
 export type AWSCredentialProvider = () => Promise<AWSCredentials>;
 
 export interface Env {
+  CRABBOX_PROJECT_CHECKPOINTS_ENABLED?: string;
+  CRABBOX_PROJECT_CHECKPOINT_TARGET?: string;
+  CRABBOX_PROJECT_CHECKPOINT_AUTHORITY?: string;
+  CRABBOX_PROJECT_CHECKPOINT_KEY_ID?: string;
+  CRABBOX_PROJECT_CHECKPOINT_ROOTS?: string;
+  CRABBOX_PROJECT_CHECKPOINT_PREVIOUS_KEYS?: string;
   FLEET: DurableObjectNamespace;
   CF_VERSION_METADATA?: {
     id: string;
@@ -542,6 +548,9 @@ export interface LeaseRecord {
   market?: string;
   provisioningAttempts?: ProvisioningAttempt[];
   image?: LeaseImageIdentity;
+  readyPoolConsumedAt?: string;
+  projectCheckpointKey?: string;
+  projectCheckpointGeneration?: number;
   provisioningTiming?: LeaseProvisioningTiming;
   awsSSMCommandID?: string;
   awsSSMCommandStatus?: string;
@@ -623,6 +632,8 @@ export interface ReadyPoolEntry {
   fingerprint?: string;
   compatibilityKey?: string;
   identity?: ReadyPoolIdentityV1;
+  singleUse?: boolean;
+  consumedAt?: string;
   image?: string;
   provider?: string;
   target?: TargetOS;
@@ -795,6 +806,7 @@ export interface LeaseImageIdentity {
   provider?: Provider;
   kind?: string;
   region?: string;
+  scope?: string;
   sourceID?: string;
   promotedAt?: string;
 }

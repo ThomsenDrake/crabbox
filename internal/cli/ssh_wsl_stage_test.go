@@ -141,7 +141,9 @@ func newLoopbackSFTPClient(t *testing.T, root string) *sftp.Client {
 
 func newLoopbackSFTPClientWithServerConn(t *testing.T, root string, wrap func(net.Conn) net.Conn) *sftp.Client {
 	t.Helper()
-	ctx, cancel := context.WithCancel(t.Context())
+	// Test contexts are canceled before Cleanup. Keep the server alive until
+	// the client has closed and its orderly shutdown has been checked.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
 	output, input, wait, err := startLoopbackWSLSFTPSubsystem(ctx, root, wrap)
 	if err != nil {
 		cancel()

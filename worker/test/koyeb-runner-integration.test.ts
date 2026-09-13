@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { expect, it } from "vitest";
 
 import { leaseConfig } from "../src/config";
-import { KoyebResumableProvisioning } from "../src/koyeb";
+import { KoyebClient, KoyebResumableProvisioning } from "../src/koyeb";
 import type { ProvisioningStep } from "../src/provider-provisioning";
 import { leaseProviderName } from "../src/slug";
 import type { Env, LeaseRecord } from "../src/types";
@@ -138,7 +138,7 @@ it.skipIf(!image)(
         latest_deployment_id: deploymentID,
         life_cycle: lifeCycle,
       });
-      const capability = new KoyebResumableProvisioning(env, async (input, init) => {
+      const fetcher: typeof fetch = async (input, init) => {
         const request = new Request(input, init);
         const url = new URL(request.url);
         if (url.origin === "https://koyeb.invalid") {
@@ -192,7 +192,8 @@ it.skipIf(!image)(
             .slice(0, 2048);
         }
         return response;
-      });
+      };
+      const capability = new KoyebResumableProvisioning(env, fetcher);
       const prepared = await capability.prepare(
         leaseConfig({
           provider: "koyeb",
@@ -249,6 +250,11 @@ it.skipIf(!image)(
           ["desktop-session.sh", "/usr/local/libexec/crabbox-koyeb-sandbox/desktop-session.sh"],
           ["healthcheck.sh", "/usr/local/libexec/crabbox-koyeb-sandbox/healthcheck.sh"],
           ["teardown.sh", "/usr/local/libexec/crabbox-koyeb-sandbox/teardown.sh"],
+          ["project-state.py", "/usr/local/libexec/crabbox-koyeb-sandbox/project-state.py"],
+          [
+            "project_dependencies.py",
+            "/usr/local/libexec/crabbox-koyeb-sandbox/project_dependencies.py",
+          ],
           ["crabbox-browser", "/usr/local/bin/crabbox-browser"],
           ["crabbox-worker-browser", "/usr/local/bin/crabbox-worker-browser"],
           ["crabbox-worker-terminal", "/usr/local/bin/crabbox-worker-terminal"],
@@ -365,12 +371,32 @@ it.skipIf(!image)(
           canceled: false,
         });
         if (step.phase === "blocked") {
+          const diagnostic = await request("/run", {
+            cmd:
+              "python3 -c " +
+              shellQuote(
+                [
+                  "import importlib.util,json,pathlib,sys,os,stat",
+                  "p='/usr/local/libexec/crabbox-koyeb-sandbox'",
+                  "sys.path.insert(0,p)",
+                  "s=importlib.util.spec_from_file_location('state',p+'/project-state.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)",
+                  "try: m.snapshot(pathlib.Path('/home/crabbox'))",
+                  "except Exception as e: print(json.dumps({'class':type(e).__name__,'errno':getattr(e,'errno',None),'reason':str(e) if isinstance(e,ValueError) else 'filesystem-operation-failed'}))",
+                  "for root,dirs,files in os.walk('/home/crabbox',followlinks=False):",
+                  " for name in dirs+files:",
+                  "  path=pathlib.Path(root,name); mode=path.lstat().st_mode",
+                  "  if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)): print(json.dumps({'relative':str(path.relative_to('/home/crabbox')),'kind':stat.S_IFMT(mode),'target':os.readlink(path) if stat.S_ISLNK(mode) else None}))",
+                ].join("\n"),
+              ),
+          });
+          const diagnosticBody = (await diagnostic.json()) as { stdout?: string };
           throw new Error(
             JSON.stringify({
               phase,
               reason: step.blockedReason,
               state: step.state,
               bootstrapDiagnostic,
+              syntheticHomeDiagnostic: diagnosticBody.stdout?.slice(0, 4096),
             }),
           );
         }
@@ -389,6 +415,31 @@ it.skipIf(!image)(
       expect(definition?.routes).toEqual([]);
       const access = step.publication!.access;
       expect(access.sshPort).toBe("3031");
+      Object.assign(lease, {
+        state: "active",
+        cloudID: serviceID,
+        region: "was",
+        image: step.publication!.image,
+        host: privateHost,
+        sshPort: access.sshPort,
+        workRoot: access.workRoot,
+      });
+      const client = new KoyebClient(env, fetcher);
+      await client.prepareReadyPoolLease(lease);
+      await client.claimReadyPoolLease(lease, "a".repeat(64));
+      await client.claimReadyPoolLease(lease, "a".repeat(64));
+      // A consumed runner must return the helper's exact categorical denial,
+      // not an unrelated transport/provider failure.
+      await expect(client.prepareReadyPoolLease(lease)).rejects.toMatchObject({
+        name: "ProjectCheckpointError",
+        code: "checkpoint_project_state_failed",
+        message: "checkpoint_project_state_failed",
+      });
+      await expect(client.claimReadyPoolLease(lease, "b".repeat(64))).rejects.toMatchObject({
+        name: "ProjectCheckpointError",
+        code: "checkpoint_project_state_failed",
+        message: "checkpoint_project_state_failed",
+      });
       const knownHosts = join(directory, "known_hosts");
       await writeFile(
         knownHosts,
@@ -422,6 +473,83 @@ it.skipIf(!image)(
           ],
           { timeout: 30_000, env: dockerEnvironment },
         );
+      const project = `${access.workRoot}/checkpoint-project`;
+      await ssh(
+        [
+          "set -eu",
+          `mkdir -p ${shellQuote(project + "/bin")}`,
+          `cd ${shellQuote(project)}`,
+          "git init --quiet",
+          "printf tracked > app.js",
+          "git add app.js",
+          "printf 'uncommitted edit' > app.js",
+          "printf '.ignored-work\\n' > .gitignore",
+          "printf 'untracked ignored work' > .ignored-work",
+          "ln -s ../app.js bin/app",
+          "printf metadata > .git/replacement-marker",
+        ].join("; "),
+      );
+      const saved = JSON.parse(
+        await client.runProjectState(lease, {
+          action: "capture",
+          root: project,
+          allowedRoot: access.workRoot,
+        }),
+      ) as { content: string; sha256: string };
+      await ssh(
+        `cd ${shellQuote(project)} && printf changed > app.js && printf extra > discard-on-restore`,
+      );
+      const restored = JSON.parse(
+        await client.runProjectState(lease, {
+          action: "restore",
+          root: project,
+          allowedRoot: access.workRoot,
+          ...saved,
+        }),
+      ) as { recovery: string; sha256: string };
+      expect(restored).toMatchObject({ recovery: "filesystem-only", sha256: saved.sha256 });
+      const files = await ssh(
+        [
+          "set -eu",
+          `cd ${shellQuote(project)}`,
+          'test "$(cat app.js)" = "uncommitted edit"',
+          'test "$(cat bin/app)" = "uncommitted edit"',
+          'test "$(cat .ignored-work)" = "untracked ignored work"',
+          'test "$(cat .git/replacement-marker)" = metadata',
+          "test ! -e discard-on-restore",
+          "printf checkpoint-restored",
+        ].join("; "),
+      );
+      expect(files.stdout).toBe("checkpoint-restored");
+      // Only the test harness is copied. The implementation is loaded from the
+      // packaged image, including Linux's nonempty atomic directory exchange.
+      await docker([
+        "cp",
+        join(imageRoot, "project-state.test.py"),
+        `${containerID}:/tmp/project-state.test.py`,
+      ]);
+      const packagedTests = await execute(
+        "docker",
+        [
+          "exec",
+          "--env",
+          "PYTHONDONTWRITEBYTECODE=1",
+          "--env",
+          "CRABBOX_PROJECT_STATE_TEST_MODULE_DIR=/usr/local/libexec/crabbox-koyeb-sandbox",
+          containerID,
+          "python3",
+          "/tmp/project-state.test.py",
+          "-v",
+        ],
+        {
+          env: dockerEnvironment,
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      expect(packagedTests.stderr).toMatch(/Ran \d+ tests[\s\S]*\bOK\b/);
+      expect(packagedTests.stderr).not.toContain("skipped");
+      process.stdout.write(packagedTests.stderr);
       const result = await ssh(
         [
           "set -eu",
@@ -498,6 +626,11 @@ it.skipIf(!image)(
           bootstrapCompletedBeforeBind: true,
           browserCDPReady: true,
           terminalHookExecuted: true,
+          cleanClaimSingleUse: true,
+          checkpointThroughPrivateExecutor: true,
+          uncommittedIgnoredFilesRecovered: true,
+          linuxAtomicReplacement: true,
+          packagedFilesystemDependencyTests: true,
           sshWorkspace: access.workRoot,
         }) + "\n",
       );

@@ -1,5 +1,6 @@
 import type { LeaseConfig } from "./config";
 import { redactDiagnosticSecrets } from "./http";
+import { ProjectCheckpointError, projectCheckpointFailureCodes } from "./project-checkpoints";
 import { sshPublicKeyIdentity } from "./provider-key";
 import { providerLabelValue } from "./provider-labels";
 import {
@@ -16,6 +17,7 @@ import type {
   LeaseRecord,
   ProviderMachine,
   ProviderReleasePending,
+  ReadyPoolImageIdentity,
   TailscaleMetadata,
 } from "./types";
 
@@ -27,6 +29,7 @@ const publicKeyPath = "/run/crabbox-authorized-key.pub";
 const bootstrapCommand = "/usr/local/bin/crabbox-koyeb-bootstrap";
 const workRoot = "/workspace/crabbox";
 const imageKind = "koyeb-sandbox-runner";
+export const koyebPoolBootstrap = "clean-runner-v1";
 const pollInterval = 2_000;
 // An explicit coordinator observation budget, independent of any CLI/RPC deadline.
 const deletionConfirmationBudgetMs = 5 * 60_000;
@@ -410,6 +413,106 @@ export class KoyebClient {
       throw new ProviderResourceUnresolvedError("Koyeb lease cleanup ownership is not proven");
     }
     return observation.value;
+  }
+
+  readyPoolImageIdentity(lease: LeaseRecord): ReadyPoolImageIdentity | undefined {
+    const image = lease.image;
+    if (
+      lease.provider !== "koyeb" ||
+      lease.target !== "linux" ||
+      lease.architecture !== "amd64" ||
+      lease.region !== this.region ||
+      lease.serverType !== this.instanceType ||
+      image?.provider !== "koyeb" ||
+      image.kind !== imageKind ||
+      image.source !== "explicit" ||
+      image.id !== this.image ||
+      image.region !== lease.region ||
+      image.scope !== koyebReadyPoolScope(this) ||
+      image.sourceID !== this.registrySecret
+    )
+      return undefined;
+    return { provider: "koyeb", scope: image.scope, id: image.id };
+  }
+
+  supportsReadyPoolImageIdentity(identity: ReadyPoolImageIdentity): boolean {
+    return (
+      identity.provider === "koyeb" &&
+      identity.id === this.image &&
+      identity.scope === koyebReadyPoolScope(this)
+    );
+  }
+
+  async observeReadyPoolImageIdentity(lease: LeaseRecord): Promise<LeaseImageIdentity | undefined> {
+    if (!this.readyPoolImageIdentity(lease)) return undefined;
+    const owned = await this.ownedServiceForLease(lease);
+    if (!owned || owned.service.status !== "HEALTHY" || owned.deployment.status !== "HEALTHY") {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb ready pool requires a healthy owned deployment",
+      );
+    }
+    return lease.image;
+  }
+
+  async prepareReadyPoolLease(lease: LeaseRecord): Promise<void> {
+    const value = JSON.parse(await this.runProjectState(lease, { action: "pool-check" })) as Record<
+      string,
+      unknown
+    >;
+    if (value["schema"] !== "crabbox-clean-runner/v1" || value["state"] !== "clean")
+      throw new ProviderResourceUnresolvedError("Koyeb clean runner proof is invalid");
+  }
+
+  async claimReadyPoolLease(lease: LeaseRecord, claim: string): Promise<void> {
+    const value = JSON.parse(
+      await this.runProjectState(lease, { action: "pool-claim", claim }),
+    ) as Record<string, unknown>;
+    if (value["schema"] !== "crabbox-clean-runner/v1" || value["state"] !== "claimed")
+      throw new ProviderResourceUnresolvedError("Koyeb clean runner claim is invalid");
+  }
+
+  async runProjectState(lease: LeaseRecord, input: Record<string, unknown>): Promise<string> {
+    const owned = await this.ownedServiceForLease(lease);
+    if (!owned || owned.service.status !== "HEALTHY" || owned.deployment.status !== "HEALTHY") {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb project state requires a healthy owned deployment",
+      );
+    }
+    const plan = planForLeaseCleanup(this, lease);
+    const management = managementTarget(owned, plan);
+    if (!management || plan.transport !== "koyeb-mesh") {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb project state requires the private mesh transport",
+      );
+    }
+    // Keep large restores off argv/env limits. The root-owned staging file is consumed and
+    // removed before the helper drops privileges to the project user.
+    const requestPath = `/var/lib/crabbox-koyeb/project-request-${crypto.randomUUID()}.json`;
+    await this.managementWriteFile(
+      management.baseURL,
+      undefined,
+      owned.sandboxSecret,
+      requestPath,
+      JSON.stringify({ ...input, leaseID: plan.runnerLeaseID }),
+    );
+    const result = await this.managementRun(management.baseURL, undefined, owned.sandboxSecret, {
+      cmd: "/usr/bin/python3 /usr/local/libexec/crabbox-koyeb-sandbox/project-state.py",
+      cwd: workRoot,
+      env: { CRABBOX_PROJECT_STATE_REQUEST_PATH: requestPath },
+    });
+    if (result.code !== 0) {
+      // A project may contain secrets in paths or output. Keep provider diagnostics categorical.
+      let code: unknown;
+      try {
+        code = (JSON.parse(result.stderr) as Record<string, unknown>)["error"];
+      } catch {
+        code = undefined;
+      }
+      if (typeof code === "string" && projectCheckpointFailureCodes.has(code))
+        throw new ProjectCheckpointError(code);
+      throw new ProviderResourceUnresolvedError("Koyeb project state operation failed");
+    }
+    return result.stdout;
   }
 
   async deleteOwnedService(
@@ -1649,8 +1752,15 @@ function imageIdentity(plan: KoyebProvisioningPlan): LeaseImageIdentity {
     provider: "koyeb",
     kind: imageKind,
     region: plan.region,
+    scope: koyebReadyPoolScope(plan),
     ...(plan.registrySecret ? { sourceID: plan.registrySecret } : {}),
   };
+}
+
+export function koyebReadyPoolScope(
+  scope: Pick<KoyebConfiguration, "organizationID" | "appID" | "region" | "instanceType">,
+): string {
+  return `koyeb:${scope.organizationID}:${scope.appID}:${scope.region}:${scope.instanceType}:${koyebPoolBootstrap}`;
 }
 
 function deploymentEnvironment(deployment: KoyebDeployment): Record<string, string> {

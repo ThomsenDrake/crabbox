@@ -177,6 +177,7 @@ type CoordinatorLeaseImage struct {
 	Provider   string `json:"provider,omitempty"`
 	Kind       string `json:"kind,omitempty"`
 	Region     string `json:"region,omitempty"`
+	Scope      string `json:"scope,omitempty"`
 	SourceID   string `json:"sourceID,omitempty"`
 	PromotedAt string `json:"promotedAt,omitempty"`
 }

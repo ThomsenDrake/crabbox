@@ -273,7 +273,7 @@ start_owned x11vnc "-rfbport 5900" \
       /usr/bin/x11vnc -display "$display" -localhost -rfbport 5900 -forever -shared \
         -rfbauth "$vnc_auth_file" -noshm -wait 16 -defer 8 -nowait_bog
 
-for process_pattern in 'xfce4-terminal' 'google-chrome'; do
+for process_pattern in 'xfce4-terminal'; do
   process_ready=false
   for _ in $(seq 1 60); do
     if pgrep -u "$ssh_user" -f "$process_pattern" >/dev/null 2>&1; then
@@ -327,5 +327,6 @@ mv -fT -- "$ready_tmp" "${state_root}/crabbox-ready.json"
 
 CRABBOX_KOYEB_STATE_ROOT="$state_root" CRABBOX_KOYEB_RUNTIME_ROOT="$runtime_root" \
   /usr/local/libexec/crabbox-koyeb-sandbox/healthcheck.sh >/dev/null
+/usr/bin/python3 /usr/local/libexec/crabbox-koyeb-sandbox/project-state.py --record-clean-baseline
 bootstrap_succeeded=true
 cat "${state_root}/crabbox-ready.json"

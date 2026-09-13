@@ -12,6 +12,13 @@ session_log_root="${CRABBOX_KOYEB_SESSION_LOG_ROOT:-${XDG_RUNTIME_DIR}}"
 [[ -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]] || exit 1
 [[ "$session_log_root" == "$XDG_RUNTIME_DIR" ]] || exit 1
 
+# Desktop caches, icon links and GPG-agent sockets are runtime state. Keep them
+# out of the clean project user's home, which is checked before a pool claim.
+export XDG_CONFIG_HOME="${XDG_RUNTIME_DIR}/desktop-config"
+export XDG_CACHE_HOME="${XDG_RUNTIME_DIR}/desktop-cache"
+export GNUPGHOME="${XDG_RUNTIME_DIR}/gnupg"
+install -d -m 0700 -- "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$GNUPGHOME"
+
 session_pid=""
 session_ready=false
 cleanup() {
@@ -36,7 +43,7 @@ done
 
 /usr/bin/xfce4-terminal --title="Crabbox Desktop" --geometry=110x32+48+48 \
   >"${session_log_root}/terminal.log" 2>&1 &
-/usr/local/bin/crabbox-browser about:blank \
-  >"${session_log_root}/browser.log" 2>&1 &
+# Browser profiles are created only on an explicit, post-allocation launch.
+# An idle generic runner must contain no browser session or profile state.
 
 wait "$session_pid"

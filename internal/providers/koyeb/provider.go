@@ -3,6 +3,7 @@ package koyeb
 import (
 	"flag"
 	"regexp"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -18,12 +19,13 @@ func init() {
 type Provider struct{}
 
 var (
-	_ core.Provider                       = Provider{}
-	_ core.DoctorProvider                 = Provider{}
-	_ core.ProviderArchitectureCapability = Provider{}
-	_ core.ProviderConfigDefaulter        = Provider{}
-	_ core.ProviderSSHTargetConfigurer    = Provider{}
-	_ core.ProviderServerTypeProvider     = Provider{}
+	_ core.Provider                                 = Provider{}
+	_ core.DoctorProvider                           = Provider{}
+	_ core.ProviderArchitectureCapability           = Provider{}
+	_ core.ProviderConfigDefaulter                  = Provider{}
+	_ core.ProviderSSHTargetConfigurer              = Provider{}
+	_ core.ProviderServerTypeProvider               = Provider{}
+	_ core.ProviderReadyPoolImageIdentityCapability = Provider{}
 )
 
 func (Provider) Name() string      { return providerName }
@@ -76,6 +78,23 @@ func (Provider) ConfigureSSHTarget(target *core.SSHTarget, _ string) {
 func (Provider) ServerTypeForConfig(cfg core.Config) string { return cfg.ServerType }
 
 func (Provider) ServerTypeForClass(string) string { return "" }
+
+func (Provider) ReadyPoolImageIdentityMatchesLease(req core.ProviderReadyPoolImageIdentityRequest) bool {
+	image := req.Lease.Image
+	if req.Identity.Provider != providerName || req.Lease.Provider != providerName || image == nil ||
+		image.Provider != providerName || image.Kind != "koyeb-sandbox-runner" || image.Source != "explicit" ||
+		image.ID != req.Identity.ID || image.Scope != req.Identity.Scope || image.Region != req.Lease.Region {
+		return false
+	}
+	parts := strings.Split(image.Scope, ":")
+	return len(parts) == 6 && parts[0] == providerName && koyebUUIDPattern.MatchString(parts[1]) &&
+		koyebUUIDPattern.MatchString(parts[2]) && parts[3] == req.Lease.Region &&
+		parts[4] == req.Lease.ServerType && parts[5] == "clean-runner-v1" &&
+		koyebImagePattern.MatchString(image.ID) && req.Lease.Region != "" && req.Lease.ServerType != ""
+}
+
+var koyebUUIDPattern = regexp.MustCompile(`^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$`)
+var koyebImagePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]*(?:/[a-z0-9][a-z0-9._-]*)+(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[a-f0-9]{64}$`)
 
 func (p Provider) Configure(core.Config, core.Runtime) (core.Backend, error) {
 	return newBackend(p.Spec()), nil

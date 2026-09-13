@@ -428,12 +428,18 @@ it.skipIf(!image)(
       await client.prepareReadyPoolLease(lease);
       await client.claimReadyPoolLease(lease, "a".repeat(64));
       await client.claimReadyPoolLease(lease, "a".repeat(64));
-      await expect(client.prepareReadyPoolLease(lease)).rejects.toThrow(
-        "Koyeb project state operation failed",
-      );
-      await expect(client.claimReadyPoolLease(lease, "b".repeat(64))).rejects.toThrow(
-        "Koyeb project state operation failed",
-      );
+      // A consumed runner must return the helper's exact categorical denial,
+      // not an unrelated transport/provider failure.
+      await expect(client.prepareReadyPoolLease(lease)).rejects.toMatchObject({
+        name: "ProjectCheckpointError",
+        code: "checkpoint_project_state_failed",
+        message: "checkpoint_project_state_failed",
+      });
+      await expect(client.claimReadyPoolLease(lease, "b".repeat(64))).rejects.toMatchObject({
+        name: "ProjectCheckpointError",
+        code: "checkpoint_project_state_failed",
+        message: "checkpoint_project_state_failed",
+      });
       const knownHosts = join(directory, "known_hosts");
       await writeFile(
         knownHosts,

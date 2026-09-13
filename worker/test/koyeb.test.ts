@@ -2,15 +2,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { leaseConfig } from "../src/config";
-import { FleetCoordinator } from "../src/fleet";
+import { FleetCoordinator, KoyebProvider } from "../src/fleet";
 import { KoyebClient, KoyebHTTPError, KoyebResumableProvisioning } from "../src/koyeb";
 import {
   provisioningOperationKey,
   type LeaseProvisioningOperation,
 } from "../src/lease-provisioning";
-import type { ProvisioningStep } from "../src/provider-provisioning";
+import { orgKeyForLabel } from "../src/org-identity";
+import { providerLabelValue } from "../src/provider-labels";
+import {
+  ProviderResourceUnresolvedError,
+  type ProvisioningStep,
+} from "../src/provider-provisioning";
 import { leaseProviderName } from "../src/slug";
-import type { Env, LeaseRecord } from "../src/types";
+import type { Env, LeaseRecord, ProviderCleanupEvidence } from "../src/types";
 import { ProvisioningTestRuntime, ProvisioningTestStorage } from "./provisioning-fixtures";
 
 const serviceID = "11111111-1111-4111-8111-111111111111";
@@ -276,6 +281,254 @@ async function advanceFleetProvisioning(
   }
   throw new Error("Koyeb provisioning did not publish an active lease");
 }
+
+async function activeCleanupFixture() {
+  const active = lease({
+    state: "active",
+    cloudID: serviceID,
+    region: "was",
+    providerScope: await new KoyebClient(baseEnv, vi.fn<typeof fetch>()).providerScope(),
+    image: {
+      id: runnerImage,
+      source: "explicit",
+      provider: "koyeb",
+      kind: "koyeb-sandbox-runner",
+      region: "was",
+      sourceID: registrySecret,
+    },
+  });
+  const state = {
+    deletes: 0,
+    requests: [] as string[],
+    observations: [] as ProviderCleanupEvidence[],
+    observe: () => Response.json({ service: service({ status: "DELETING" }) }),
+    delete: () => Response.json({ service: service({ status: "DELETING" }) }),
+  };
+  const fetcher = vi.fn<typeof fetch>(async (input) => {
+    const incoming = input instanceof Request ? input : new Request(input);
+    const path = new URL(incoming.url).pathname;
+    state.requests.push(`${incoming.method} ${path}`);
+    if (path === `/v1/services/${serviceID}` && incoming.method === "DELETE") {
+      state.deletes += 1;
+      return state.delete();
+    }
+    if (path === `/v1/services/${serviceID}`) {
+      return state.deletes ? state.observe() : Response.json({ service: service() });
+    }
+    if (path === `/v1/deployments/${deploymentID}`) {
+      const owned = deployment("u".repeat(32));
+      owned.definition.env = owned.definition.env.map((entry) =>
+        entry.key === "CRABBOX_LEASE_ORG"
+          ? { ...entry, value: providerLabelValue(active.org) }
+          : entry,
+      );
+      return Response.json({ deployment: owned });
+    }
+    throw new Error(`unexpected request ${incoming.method} ${path}`);
+  });
+  const context = {
+    assertCleanupOwner: vi.fn<() => Promise<void>>(async () => {}),
+    saveCleanupEvidence: vi.fn<(evidence: ProviderCleanupEvidence) => Promise<void>>(
+      async (evidence) => {
+        active.providerCleanup = structuredClone(evidence);
+        state.observations.push(structuredClone(evidence));
+      },
+    ),
+  };
+  return {
+    active,
+    state,
+    context,
+    fetcher,
+    advance: () => new KoyebClient(baseEnv, fetcher).deleteOwnedService(active, context),
+  };
+}
+
+async function activeFleetCleanupFixture() {
+  const fixture = await activeCleanupFixture();
+  fixture.active.org = orgKeyForLabel("example-org");
+  const storage = new ProvisioningTestStorage();
+  await storage.put(`lease:${fixture.active.id}`, fixture.active);
+  const runtime = new ProvisioningTestRuntime(storage);
+  const coordinator = new FleetCoordinator(runtime, fleetEnv, {
+    koyeb: new KoyebProvider(fleetEnv, fixture.fetcher),
+  });
+  const release = () =>
+    coordinator.fetch(
+      fleetRequest("POST", `/v1/leases/${fixture.active.id}/release`, { delete: true }),
+    );
+  const tick = async () => {
+    await coordinator.alarm();
+    await Promise.all(runtime.maintenance);
+    return storage.get<LeaseRecord>(`lease:${fixture.active.id}`);
+  };
+  const publicLease = async () => {
+    const response = await coordinator.fetch(
+      fleetRequest("GET", `/v1/leases/${fixture.active.id}`),
+    );
+    return response.json();
+  };
+  return { ...fixture, storage, release, tick, publicLease };
+}
+
+describe("Koyeb active lease deletion confirmation", () => {
+  it.each([
+    "DELETING",
+    "HEALTHY",
+    "STARTING",
+    "DEGRADED",
+    "UNHEALTHY",
+    "PAUSING",
+    "PAUSED",
+    "RESUMING",
+  ])(
+    "keeps an accepted deletion with owned %s observation pending and resumes without another DELETE",
+    async (status) => {
+      const { active, state, advance } = await activeCleanupFixture();
+      state.observe = () => {
+        expect(active.providerCleanup).toMatchObject({
+          deleteResult: "accepted",
+          deleteAcceptedAt: expect.any(String),
+        });
+        return Response.json({ service: service({ status }) });
+      };
+      await expect(advance()).resolves.toMatchObject({
+        status: "pending",
+        nextCheckAt: expect.any(String),
+      });
+      await expect(advance()).resolves.toMatchObject({ status: "pending" });
+      state.observe = () => Response.json({ service: service({ status: "DELETED" }) });
+      await expect(advance()).resolves.toBeUndefined();
+      expect(state.deletes).toBe(1);
+      expect(active.providerCleanup).toMatchObject({ confirmation: { method: "service-deleted" } });
+    },
+  );
+
+  it.each([
+    ["unknown status", () => Response.json({ service: service({ status: "FUTURE_UNKNOWN" }) })],
+    ["malformed service", () => Response.json({})],
+    ["malformed JSON", () => new Response("{")],
+    ["wrong service", () => Response.json({ service: service({ id: latestDeploymentID }) })],
+    ["wrong app", () => Response.json({ service: service({ app_id: latestDeploymentID }) })],
+    [
+      "changed deployment",
+      () => Response.json({ service: service({ latest_deployment_id: latestDeploymentID }) }),
+    ],
+    ["authentication", () => new Response("unauthorized", { status: 401 })],
+    ["authorization", () => new Response("forbidden", { status: 403 })],
+    [
+      "transport",
+      () => {
+        throw new Error("synthetic transport failure");
+      },
+    ],
+  ] as const)(
+    "does not turn a %s confirmation failure into pending or complete",
+    async (_label, observation) => {
+      const { active, state, advance } = await activeCleanupFixture();
+      state.observe = observation;
+      await expect(advance()).rejects.toBeInstanceOf(ProviderResourceUnresolvedError);
+      expect(state.deletes).toBe(1);
+      expect(active.providerCleanup?.confirmation).toBeUndefined();
+      expect(active.providerCleanup).toMatchObject({ deleteResult: "accepted" });
+    },
+  );
+
+  it.each([401, 403, 500, 0])(
+    "keeps DELETE failure %s terminal and never redispatches its uncertain intent",
+    async (status) => {
+      const { active, state, advance } = await activeCleanupFixture();
+      state.delete = () => {
+        if (!status) throw new Error("synthetic lost delete response");
+        return new Response("synthetic delete failure", { status });
+      };
+      await expect(advance()).rejects.toBeInstanceOf(ProviderResourceUnresolvedError);
+      expect(active.providerCleanup).not.toHaveProperty("deleteAcceptedAt");
+      await expect(advance()).rejects.toThrow("dispatch outcome is unresolved");
+      expect(state.deletes).toBe(1);
+      expect(active.providerCleanup?.confirmation).toBeUndefined();
+    },
+  );
+
+  it("exhausts its explicit observation budget without completing or repeating DELETE", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { active, state, advance } = await activeCleanupFixture();
+    await expect(advance()).resolves.toMatchObject({ status: "pending" });
+    expect(active.providerCleanup).toMatchObject({ provider: "koyeb" });
+    const evidence = active.providerCleanup!;
+    if (evidence.provider !== "koyeb") throw new Error("wrong cleanup evidence");
+    vi.setSystemTime(new Date(evidence.confirmationDeadline));
+    await expect(advance()).rejects.toThrow("confirmation deadline exhausted");
+    expect(state.deletes).toBe(1);
+    expect(active.providerCleanup?.confirmation).toBeUndefined();
+  });
+
+  it("confirms DELETE not-found only when GET independently observes absence", async () => {
+    const { active, state, advance } = await activeCleanupFixture();
+    state.delete = () => new Response("not found", { status: 404 });
+    await expect(advance()).rejects.toThrow("absence evidence conflicts with a present service");
+    expect(active.providerCleanup?.confirmation).toBeUndefined();
+    state.observe = () => new Response("not found", { status: 404 });
+    await expect(advance()).resolves.toBeUndefined();
+    expect(active.providerCleanup).toMatchObject({
+      deleteResult: "not-found",
+      confirmation: { method: "service-absent" },
+    });
+    expect(state.deletes).toBe(1);
+  });
+
+  it("retains only bounded stage and HTTP status when provider errors contain secrets", async () => {
+    const { state, advance } = await activeCleanupFixture();
+    state.observe = () => new Response("unrelated-secret-value", { status: 403 });
+    await expect(advance()).rejects.toThrow("Koyeb cleanup failed stage=confirmation http=403");
+    state.observe = () => {
+      throw new Error("other-sensitive-transport-value");
+    };
+    await expect(advance()).rejects.toThrow("Koyeb cleanup failed stage=confirmation");
+  });
+
+  it("fences changed lease identity on a resumed confirmation", async () => {
+    const { active, state, advance } = await activeCleanupFixture();
+    await advance();
+    active.createAttemptGeneration = "replacement-generation";
+    const requestCount = state.requests.length;
+    await expect(advance()).rejects.toThrow("retained cleanup evidence does not match");
+    expect(state.requests).toHaveLength(requestCount);
+    expect(state.deletes).toBe(1);
+  });
+
+  it("does not mutate when dispatch evidence cannot be durably saved", async () => {
+    const { state, context, advance } = await activeCleanupFixture();
+    context.saveCleanupEvidence.mockRejectedValueOnce(new Error("synthetic persistence failure"));
+    await expect(advance()).rejects.toBeInstanceOf(ProviderResourceUnresolvedError);
+    expect(state.deletes).toBe(0);
+  });
+
+  it("does not repeat DELETE when acceptance persistence was interrupted", async () => {
+    const { state, context, advance } = await activeCleanupFixture();
+    const save = context.saveCleanupEvidence.getMockImplementation()!;
+    context.saveCleanupEvidence.mockImplementation(async (evidence) => {
+      if (evidence.provider === "koyeb" && evidence.deleteAcceptedAt)
+        throw new Error("synthetic interrupted commit");
+      await save(evidence);
+    });
+    await expect(advance()).rejects.toBeInstanceOf(ProviderResourceUnresolvedError);
+    await expect(advance()).rejects.toThrow("dispatch outcome is unresolved");
+    expect(state.deletes).toBe(1);
+  });
+
+  it("checks the cleanup owner again after the final provider observation", async () => {
+    const { active, state, context, advance } = await activeCleanupFixture();
+    await advance();
+    state.observe = () => {
+      context.assertCleanupOwner.mockRejectedValue(new Error("synthetic ownership change"));
+      return new Response("not found", { status: 404 });
+    };
+    await expect(advance()).rejects.toThrow("stage=confirmation");
+    expect(active.providerCleanup?.confirmation).toBeUndefined();
+    expect(state.deletes).toBe(1);
+  });
+});
 
 describe("Koyeb service inventory", () => {
   it("collects 101 services while preserving scope and name filters on every page", async () => {
@@ -647,7 +900,14 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       },
     });
 
-    await expect(client.deleteOwnedService(active)).resolves.toBeUndefined();
+    await expect(
+      client.deleteOwnedService(active, {
+        assertCleanupOwner: async () => {},
+        saveCleanupEvidence: async (evidence) => {
+          active.providerCleanup = evidence;
+        },
+      }),
+    ).resolves.toBeUndefined();
     expect(deleted).toBe(true);
   });
 
@@ -1460,6 +1720,169 @@ describe("Koyeb Sandbox coordinator adapter", () => {
 });
 
 describe("Koyeb Fleet integration", () => {
+  it.each([
+    ["authentication", () => new Response("sensitive-untrusted-body", { status: 401 })],
+    ["malformed observation", () => Response.json({})],
+    ["unknown status", () => Response.json({ service: service({ status: "UNKNOWN" }) })],
+    [
+      "changed ownership",
+      () => Response.json({ service: service({ app_id: latestDeploymentID }) }),
+    ],
+  ] as const)(
+    "terminalizes %s during scheduled confirmation without another DELETE or retry",
+    async (_label, observation) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+      const fixture = await activeFleetCleanupFixture();
+      expect((await fixture.release()).status).toBe(200);
+      const pending = await fixture.tick();
+      await expect(fixture.publicLease()).resolves.toMatchObject({
+        lease: { cleanupStatus: "pending" },
+      });
+      fixture.state.observe = observation;
+      vi.setSystemTime(new Date(pending!.cleanupClaimExpiresAt!));
+      const failed = await fixture.tick();
+      expect(failed?.cleanupError).toBeDefined();
+      expect(failed?.cleanupError).not.toContain("sensitive-untrusted-body");
+      expect(failed?.cleanupFailedAt).toBeDefined();
+      expect(failed?.cleanupRetryAt).toBeUndefined();
+      expect(failed?.cleanupStartedAt).toBeUndefined();
+      expect(failed?.cleanupCompletedAt).toBeUndefined();
+      await expect(fixture.publicLease()).resolves.toMatchObject({
+        lease: { cleanupStatus: "failed" },
+      });
+      const requests = fixture.state.requests.length;
+      vi.setSystemTime(Date.now() + 600_000);
+      await fixture.tick();
+      expect(fixture.state.requests).toHaveLength(requests);
+      expect(fixture.state.deletes).toBe(1);
+    },
+  );
+
+  it("terminalizes exhausted scheduled confirmation without claiming completion or extending its deadline", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+    const fixture = await activeFleetCleanupFixture();
+    expect((await fixture.release()).status).toBe(200);
+    const pending = await fixture.tick();
+    const evidence = pending!.providerCleanup!;
+    if (evidence.provider !== "koyeb") throw new Error("wrong cleanup evidence");
+    vi.setSystemTime(new Date(evidence.confirmationDeadline));
+    const failed = await fixture.tick();
+    expect(failed?.cleanupError).toContain("confirmation deadline exhausted");
+    expect(failed?.cleanupCompletedAt).toBeUndefined();
+    expect(failed?.cleanupRetryAt).toBeUndefined();
+    expect(failed?.providerCleanup).toMatchObject({
+      confirmationDeadline: evidence.confirmationDeadline,
+    });
+    await expect(fixture.publicLease()).resolves.toMatchObject({
+      lease: { cleanupStatus: "failed" },
+    });
+    expect(fixture.state.deletes).toBe(1);
+  });
+
+  it.each([0, 4_000])(
+    "keeps accepted active-lease deletion pending across scheduler restarts with %s ms persistence delay",
+    async (persistenceDelay) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+      const storage = new ProvisioningTestStorage();
+      const providerScope = await new KoyebClient(baseEnv, vi.fn<typeof fetch>()).providerScope();
+      const active = lease({
+        state: "active",
+        cloudID: serviceID,
+        region: "was",
+        providerScope,
+        org: orgKeyForLabel("example-org"),
+        image: {
+          id: runnerImage,
+          source: "explicit",
+          provider: "koyeb",
+          kind: "koyeb-sandbox-runner",
+          region: "was",
+          sourceID: registrySecret,
+        },
+      });
+      await storage.put(`lease:${active.id}`, active);
+      const put = storage.put.bind(storage);
+      vi.spyOn(storage, "put").mockImplementation(async (key, value) => {
+        const record = value as LeaseRecord;
+        if (
+          record.providerCleanup?.provider === "koyeb" &&
+          record.providerCleanup.lastObservation &&
+          !record.providerCleanup.confirmation
+        ) {
+          vi.setSystemTime(Date.now() + persistenceDelay);
+        }
+        await put(key, value);
+      });
+      let deletes = 0;
+      let absent = false;
+      const fetcher = vi.fn<typeof fetch>(async (input) => {
+        const incoming = input instanceof Request ? input : new Request(input);
+        const path = new URL(incoming.url).pathname;
+        if (path === `/v1/services/${serviceID}` && incoming.method === "DELETE") {
+          deletes += 1;
+          return Response.json({ service: service({ status: "DELETING" }) });
+        }
+        if (path === `/v1/services/${serviceID}`) {
+          return absent
+            ? new Response("not found", { status: 404 })
+            : Response.json({ service: service({ status: deletes ? "DELETING" : "HEALTHY" }) });
+        }
+        if (path === `/v1/deployments/${deploymentID}`) {
+          const owned = deployment("u".repeat(32));
+          owned.definition.env = owned.definition.env.map((entry) =>
+            entry.key === "CRABBOX_LEASE_ORG"
+              ? { ...entry, value: providerLabelValue(active.org) }
+              : entry,
+          );
+          return Response.json({ deployment: owned });
+        }
+        throw new Error(`unexpected request ${incoming.method} ${path}`);
+      });
+      const runtime = new ProvisioningTestRuntime(storage);
+      const coordinator = new FleetCoordinator(runtime, fleetEnv, {
+        koyeb: new KoyebProvider(fleetEnv, fetcher),
+      });
+      const response = await coordinator.fetch(
+        fleetRequest("POST", `/v1/leases/${active.id}/release`, { delete: true }),
+      );
+      expect(response.status).toBe(200);
+      await coordinator.alarm();
+      await Promise.all(runtime.maintenance);
+      const pending = await storage.get<LeaseRecord>(`lease:${active.id}`);
+      expect(pending?.cleanupError).toBeUndefined();
+      expect(pending?.cleanupFailedAt).toBeUndefined();
+      expect(pending?.cleanupCompletedAt).toBeUndefined();
+      const observed = await coordinator.fetch(fleetRequest("GET", `/v1/leases/${active.id}`));
+      await expect(observed.json()).resolves.toMatchObject({ lease: { cleanupStatus: "pending" } });
+      expect(deletes).toBe(1);
+
+      const resumedRuntime = new ProvisioningTestRuntime(storage);
+      const reconstructed = new FleetCoordinator(resumedRuntime, fleetEnv, {
+        koyeb: new KoyebProvider(fleetEnv, fetcher),
+      });
+      vi.setSystemTime(new Date(pending!.cleanupClaimExpiresAt!));
+      await reconstructed.alarm();
+      await Promise.all(resumedRuntime.maintenance);
+      expect(deletes).toBe(1);
+      expect((await storage.get<LeaseRecord>(`lease:${active.id}`))?.cleanupError).toBeUndefined();
+      absent = true;
+      const next = await storage.get<LeaseRecord>(`lease:${active.id}`);
+      vi.setSystemTime(new Date(next!.cleanupClaimExpiresAt!));
+      await reconstructed.alarm();
+      await Promise.all(resumedRuntime.maintenance);
+      expect(deletes).toBe(1);
+      const finalResponse = await reconstructed.fetch(
+        fleetRequest("GET", `/v1/leases/${active.id}`),
+      );
+      await expect(finalResponse.json()).resolves.toMatchObject({
+        lease: { cleanupStatus: "complete" },
+      });
+    },
+  );
+
   it("runs scheduled maintenance with Koyeb as the workspace provider", async () => {
     const coordinator = new FleetCoordinator(
       new ProvisioningTestRuntime(new ProvisioningTestStorage()),

@@ -18,13 +18,13 @@ const wantCoordinatorRequiredError = "provider=koyeb requires a configured coord
 
 func TestProviderSpec(t *testing.T) {
 	p := Provider{}
-	if p.Name() != providerName {
-		t.Fatalf("Name()=%q want %q", p.Name(), providerName)
-	}
-	if aliases := p.Aliases(); len(aliases) != 0 {
-		t.Fatalf("Aliases()=%v want none", aliases)
-	}
 	spec := p.Spec()
+	if spec.Name != providerName {
+		t.Fatalf("Name=%q want %q", spec.Name, providerName)
+	}
+	if aliases := spec.Aliases; len(aliases) != 0 {
+		t.Fatalf("Aliases=%v want none", aliases)
+	}
 	if spec.Name != providerName || spec.Family != providerName || spec.Kind != core.ProviderKindSSHLease {
 		t.Fatalf("spec identity=%#v", spec)
 	}

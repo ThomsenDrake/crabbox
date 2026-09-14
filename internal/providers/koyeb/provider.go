@@ -26,11 +26,11 @@ var (
 	_ core.ProviderServerTypeProvider     = Provider{}
 )
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication: core.ProviderAuthentication{
+			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; cloud credentials remain server-side."},
+		},
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,
@@ -74,8 +74,6 @@ func (Provider) ConfigureSSHTarget(target *core.SSHTarget, _ string) {
 }
 
 func (Provider) ServerTypeForConfig(cfg core.Config) string { return cfg.ServerType }
-
-func (Provider) ServerTypeForClass(string) string { return "" }
 
 func (p Provider) Configure(core.Config, core.Runtime) (core.Backend, error) {
 	return newBackend(p.Spec()), nil

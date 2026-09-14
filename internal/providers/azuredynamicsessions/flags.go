@@ -7,11 +7,11 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func RegisterAzureDynamicSessionsProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterAzureDynamicSessionsProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterAzureDynamicSessionsConfigFlags(fs, defaults.AzureDynamicSessions)
 }
 
-func ApplyAzureDynamicSessionsProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplyAzureDynamicSessionsProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if cfg.Provider == providerName {
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "choose pool sizing in Azure", "choose pool sizing in Azure"); err != nil {
 			return err
@@ -21,6 +21,7 @@ func ApplyAzureDynamicSessionsProviderFlags(cfg *Config, fs *flag.FlagSet, value
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.AzureDynamicSessions, fs)
-	return nil
+	applied, err := v.Apply(&cfg.AzureDynamicSessions, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	return err
 }

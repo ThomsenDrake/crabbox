@@ -57,6 +57,7 @@ type crabboxKongCLI struct {
 	Checkpoint     checkpointKongCmd     `cmd:"" help:"Create, restore, and fork VM or workspace checkpoints."`
 	Ssh            sshKongCmd            `cmd:"" name:"ssh" passthrough:"" help:"Print the SSH command for a lease."`
 	Connect        connectKongCmd        `cmd:"" passthrough:"" help:"Open an interactive SSH session to a lease."`
+	Exec           execKongCmd           `cmd:"" passthrough:"" help:"Execute a command under the current lease claim without syncing."`
 	Open           openKongCmd           `cmd:"" passthrough:"" help:"Prepare an editor handoff for a lease."`
 	Vnc            vncKongCmd            `cmd:"" name:"vnc" passthrough:"" help:"Print or open VNC connection details for a desktop lease."`
 	Webvnc         webvncKongCmd         `cmd:"" name:"webvnc" passthrough:"" help:"Open a desktop lease or local VNC tunnel in a browser."`
@@ -115,7 +116,7 @@ func (a App) runKong(ctx context.Context, args []string) (err error) {
 	if err != nil {
 		var parseErr *kong.ParseError
 		if errors.As(err, &parseErr) {
-			return exit(2, "%v", parseErr)
+			return Exit(2, "%v", parseErr)
 		}
 		return err
 	}
@@ -282,6 +283,9 @@ type sshKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type connectKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type execKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type openKongCmd struct {
@@ -714,6 +718,7 @@ func (c *marketplaceQuoteKongCmd) Run(ctx context.Context, app App) error {
 }
 func (c *sshKongCmd) Run(ctx context.Context, app App) error     { return app.ssh(ctx, c.Args) }
 func (c *connectKongCmd) Run(ctx context.Context, app App) error { return app.connect(ctx, c.Args) }
+func (c *execKongCmd) Run(ctx context.Context, app App) error    { return app.execCommand(ctx, c.Args) }
 func (c *openKongCmd) Run(ctx context.Context, app App) error    { return app.open(ctx, c.Args) }
 func (c *vncKongCmd) Run(ctx context.Context, app App) error     { return app.vnc(ctx, c.Args) }
 func (c *webvncKongCmd) Run(ctx context.Context, app App) error  { return app.webvnc(ctx, c.Args) }
@@ -729,13 +734,13 @@ func (c *pauseKongCmd) Run(ctx context.Context, app App) error   { return app.pa
 func (c *resumeKongCmd) Run(ctx context.Context, app App) error  { return app.resume(ctx, c.Args) }
 func (c *cleanupKongCmd) Run(ctx context.Context, app App) error { return app.cleanup(ctx, c.Args) }
 func (c *pondConnectKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondConnect(ctx, stripKongCommandPath(c.Args, "pond", "connect"))
+	return app.pondConnect(ctx, c.Args)
 }
 func (c *pondDisconnectKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondDisconnect(ctx, stripKongCommandPath(c.Args, "pond", "disconnect"))
+	return app.pondDisconnect(ctx, c.Args)
 }
 func (c *pondReleaseKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondRelease(ctx, stripKongCommandPath(c.Args, "pond", "release"))
+	return app.pondRelease(ctx, c.Args)
 }
 
 func (c *desktopLaunchKongCmd) Run(ctx context.Context, app App) error {
@@ -901,7 +906,7 @@ func (c *checkpointPruneKongCmd) Run(ctx context.Context, app App) error {
 func (c *configPathKongCmd) Run(ctx context.Context, app App) error {
 	path := writableConfigPath()
 	if path == "" {
-		return exit(2, "user config directory is unavailable")
+		return Exit(2, "user config directory is unavailable")
 	}
 	fmt.Fprintln(app.Stdout, path)
 	return nil
@@ -961,7 +966,7 @@ func (c *machineCleanupKongCmd) Run(ctx context.Context, app App) error {
 }
 
 func (c *pondPeersKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondPeers(ctx, stripKongCommandPath(c.Args, "pond", "peers"))
+	return app.pondPeers(ctx, c.Args)
 }
 
 func (c *versionKongCmd) Run(app App) error {

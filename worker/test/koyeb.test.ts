@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { leaseConfig } from "../src/config";
-import { FleetCoordinator } from "../src/fleet";
+import { FleetCoordinator, KoyebProvider } from "../src/fleet";
 import { KoyebClient, KoyebHTTPError, KoyebResumableProvisioning } from "../src/koyeb";
 import {
   provisioningOperationKey,
@@ -475,7 +475,25 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       },
     });
 
-    await expect(client.deleteOwnedService(active)).resolves.toBeUndefined();
+    const assertCleanupOwner = vi.fn<() => Promise<void>>(async () => {});
+    await expect(
+      client.deleteOwnedService(active, {
+        assertCleanupOwner,
+        resourceIdentity: JSON.stringify({
+          schema: "crabbox-koyeb-cleanup/v1",
+          scope: providerScope,
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          leaseID: active.id,
+          generation: active.createAttemptGeneration,
+          serviceID,
+          deploymentID,
+          ttlSeconds: 3_600,
+          idleTimeoutSeconds: 600,
+        }),
+      }),
+    ).resolves.toBeUndefined();
+    expect(assertCleanupOwner).toHaveBeenCalledTimes(1);
     expect(deleted).toBe(true);
   });
 
@@ -1116,6 +1134,7 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       deadline: Date.now() + 60_000,
       recovering: true,
       canceled: true as const,
+      assertCleanupOwner: vi.fn<() => Promise<void>>(async () => {}),
     });
     let step: ProvisioningStep = {
       ...prepared.step,
@@ -1514,4 +1533,292 @@ describe("Koyeb Fleet integration", () => {
     expect(event.status).toBe(201);
     await expect(event.json()).resolves.toMatchObject({ event: { provider: "koyeb" } });
   });
+});
+
+async function publishedCleanupFixture() {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-09-14T12:00:00Z"));
+  const storage = new ProvisioningTestStorage();
+  const runtime = new ProvisioningTestRuntime(storage);
+  const network = {
+    definition: undefined as Record<string, unknown> | undefined,
+    deleted: false,
+    deletePending: false,
+    serviceOverrides: {} as Record<string, unknown>,
+    onDeploymentRead: undefined as (() => Promise<void>) | undefined,
+  };
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input.clone() : new Request(input);
+      requests.push(request);
+      const url = new URL(request.url);
+      if (url.pathname === "/v1/services") {
+        if (request.method === "POST") {
+          network.definition = (
+            (await request.json()) as { definition: Record<string, unknown> }
+          ).definition;
+          return Response.json({ service: service() });
+        }
+        return Response.json({
+          services: network.definition && !network.deleted ? [service()] : [],
+          has_next: false,
+        });
+      }
+      if (url.pathname === `/v1/services/${serviceID}`) {
+        if (request.method === "DELETE" && !network.deletePending) network.deleted = true;
+        return network.deleted
+          ? new Response("not found", { status: 404 })
+          : Response.json({ service: service(network.serviceOverrides) });
+      }
+      if (
+        url.pathname === `/v1/deployments/${deploymentID}` ||
+        url.pathname === `/v1/deployments/${latestDeploymentID}`
+      ) {
+        await network.onDeploymentRead?.();
+        return Response.json({
+          deployment: {
+            ...meshDeployment("unused"),
+            id: url.pathname.split("/").at(-1),
+            definition: network.definition,
+          },
+        });
+      }
+      if (url.pathname === "/health" || url.pathname === "/write_file")
+        return Response.json({ ok: true });
+      if (url.pathname === "/bind_port") return Response.json({ success: true, port: "22" });
+      if (url.pathname === "/run")
+        return Response.json({
+          stdout: JSON.stringify({
+            schema: "crabbox-koyeb-sandbox-runner/v2",
+            leaseId: serviceName,
+            ssh: { user: "crabbox", host: privateHost, port: 22, hostKey: sshHostKey },
+            network: { transport: "koyeb-mesh", privateHost },
+          }),
+          stderr: "",
+          code: 0,
+        });
+      throw new Error(`unexpected request ${request.method} ${url.pathname}`);
+    }),
+  );
+  const coordinator = new FleetCoordinator(runtime, fleetEnv);
+  const admitted = await coordinator.fetch(
+    fleetRequest("POST", "/v1/leases", { ...fleetLeaseRequest(), tailscale: false }),
+  );
+  expect(admitted.status).toBe(202);
+  const active = await advanceFleetProvisioning(storage, runtime);
+  requests.length = 0;
+  return { storage, runtime, coordinator, active, network, requests };
+}
+
+async function releaseAndClean(
+  coordinator: FleetCoordinator,
+  runtime: ProvisioningTestRuntime,
+  leaseID: string,
+): Promise<Response> {
+  const response = await coordinator.fetch(
+    fleetRequest("POST", `/v1/leases/${leaseID}/release`, { delete: true }),
+  );
+  expect(response.status).toBe(200);
+  await coordinator.alarm();
+  await Promise.all(runtime.maintenance);
+  return response;
+}
+
+function cleanupDeletes(requests: Request[]): Request[] {
+  return requests.filter((request) => request.method === "DELETE");
+}
+
+describe("Koyeb cleanup authority and immutable publication", () => {
+  it("releases the original allocation after heartbeat and serialized Fleet restart", async () => {
+    const fixture = await publishedCleanupFixture();
+    const heartbeat = await fixture.coordinator.fetch(
+      fleetRequest("POST", `/v1/leases/${fixture.active.id}/heartbeat`, {
+        idleTimeoutSeconds: 1_200,
+      }),
+    );
+    expect(heartbeat.status).toBe(200);
+    expect(
+      (await fixture.storage.get<LeaseRecord>(`lease:${fixture.active.id}`))?.idleTimeoutSeconds,
+    ).toBe(1_200);
+    const storage = new ProvisioningTestStorage();
+    storage.values = new Map(JSON.parse(JSON.stringify([...fixture.storage.values])));
+    const runtime = new ProvisioningTestRuntime(storage);
+    const restarted = new FleetCoordinator(runtime, fleetEnv);
+    const released = await releaseAndClean(restarted, runtime, fixture.active.id);
+    expect(released.status).toBe(200);
+    expect(cleanupDeletes(fixture.requests)).toHaveLength(1);
+    const operation = await storage.get<LeaseProvisioningOperation>(
+      provisioningOperationKey(fixture.active.id),
+    );
+    expect(operation?.step.publication?.server.resourceIdentity).toBeTruthy();
+    expect(
+      (await storage.get<LeaseRecord>(`lease:${fixture.active.id}`))?.cleanupCompletedAt,
+    ).toBeTruthy();
+  });
+
+  it.each(["expired", "replaced", "generation", "publication"])(
+    "does not DELETE when %s authority changes during a delayed deployment read",
+    async (change) => {
+      const fixture = await publishedCleanupFixture();
+      fixture.network.onDeploymentRead = async () => {
+        const current = (await fixture.storage.get<LeaseRecord>(`lease:${fixture.active.id}`))!;
+        if (change === "expired")
+          current.cleanupClaimExpiresAt = new Date(Date.now() - 1).toISOString();
+        if (change === "replaced")
+          current.cleanupStartedAt = new Date(Date.now() + 1).toISOString();
+        if (change === "generation") current.createAttemptGeneration = "replacement-generation";
+        if (change === "publication")
+          await fixture.storage.delete(provisioningOperationKey(current.id));
+        await fixture.storage.put(`lease:${current.id}`, current);
+      };
+      await releaseAndClean(fixture.coordinator, fixture.runtime, fixture.active.id);
+      expect(
+        fixture.requests.some((r) => new URL(r.url).pathname === `/v1/deployments/${deploymentID}`),
+      ).toBe(true);
+      expect(cleanupDeletes(fixture.requests)).toHaveLength(0);
+    },
+  );
+
+  it("refuses present-resource cleanup without a production owner callback", async () => {
+    const fixture = await publishedCleanupFixture();
+    const operation = (await fixture.storage.get<LeaseProvisioningOperation>(
+      provisioningOperationKey(fixture.active.id),
+    ))!;
+    const provider = new KoyebProvider(fleetEnv);
+    await expect(
+      provider.releaseLease(fixture.active, {
+        resourceIdentity: operation.step.publication?.server.resourceIdentity,
+      }),
+    ).rejects.toThrow("Koyeb cleanup requires current coordinator authority");
+    expect(cleanupDeletes(fixture.requests)).toHaveLength(0);
+  });
+
+  it.each([
+    "missing publication",
+    "missing identity",
+    "wrong generation",
+    "wrong resource",
+    "malformed identity",
+  ])("fails closed for %s on a present service", async (change) => {
+    const fixture = await publishedCleanupFixture();
+    const key = provisioningOperationKey(fixture.active.id);
+    const operation = (await fixture.storage.get<LeaseProvisioningOperation>(key))!;
+    if (change === "missing publication") delete operation.step.publication;
+    if (change === "missing identity") delete operation.step.publication!.server.resourceIdentity;
+    if (change === "wrong generation") operation.generation = "replacement-generation";
+    if (change === "wrong resource")
+      operation.step.publication!.server.cloudID = latestDeploymentID;
+    if (change === "malformed identity") operation.step.publication!.server.resourceIdentity = "{}";
+    await fixture.storage.put(key, operation);
+    await releaseAndClean(fixture.coordinator, fixture.runtime, fixture.active.id);
+    expect(cleanupDeletes(fixture.requests)).toHaveLength(0);
+  });
+
+  it.each(["lifecycle", "deployment", "service identity"])(
+    "rejects changed %s after publication",
+    async (change) => {
+      const fixture = await publishedCleanupFixture();
+      fixture.network.serviceOverrides =
+        change === "lifecycle"
+          ? { life_cycle: { delete_after_create: 3_600, delete_after_sleep: 1_200 } }
+          : change === "deployment"
+            ? { active_deployment_id: latestDeploymentID, latest_deployment_id: latestDeploymentID }
+            : { id: latestDeploymentID };
+      await releaseAndClean(fixture.coordinator, fixture.runtime, fixture.active.id);
+      expect(cleanupDeletes(fixture.requests)).toHaveLength(0);
+    },
+  );
+
+  it("retains idempotent absence even for a legacy publication without identity", async () => {
+    const fixture = await publishedCleanupFixture();
+    const key = provisioningOperationKey(fixture.active.id);
+    const operation = (await fixture.storage.get<LeaseProvisioningOperation>(key))!;
+    delete operation.step.publication!.server.resourceIdentity;
+    await fixture.storage.put(key, operation);
+    fixture.network.deleted = true;
+    const released = await releaseAndClean(fixture.coordinator, fixture.runtime, fixture.active.id);
+    expect(released.status).toBe(200);
+    expect(cleanupDeletes(fixture.requests)).toHaveLength(0);
+    expect(
+      (await fixture.storage.get<LeaseRecord>(`lease:${fixture.active.id}`))?.cleanupCompletedAt,
+    ).toBeTruthy();
+  });
+
+  it("does not confirm active cleanup while the deleted service is still present", async () => {
+    const fixture = await publishedCleanupFixture();
+    fixture.network.deletePending = true;
+    await releaseAndClean(fixture.coordinator, fixture.runtime, fixture.active.id);
+    expect(cleanupDeletes(fixture.requests)).toHaveLength(1);
+    const current = (await fixture.storage.get<LeaseRecord>(`lease:${fixture.active.id}`))!;
+    expect(current.cleanupCompletedAt).toBeUndefined();
+    expect(current.cleanupError).toContain("Koyeb service deletion is not yet confirmed");
+  });
+});
+
+describe("Koyeb resumable destructive boundary", () => {
+  it.each(["valid", "expired", "replaced", "missing"])(
+    "checks %s authority after ownership reads without advancing a refused delete",
+    async (authority) => {
+      const requests: Request[] = [];
+      let checkedRead = false;
+      let revoked = false;
+      const capability = new KoyebResumableProvisioning(baseEnv, async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        requests.push(request);
+        const url = new URL(request.url);
+        if (request.method === "DELETE") return Response.json({});
+        if (url.pathname === `/v1/services/${serviceID}`)
+          return Response.json({ service: service() });
+        if (url.pathname === `/v1/deployments/${deploymentID}`) {
+          await Promise.resolve();
+          checkedRead = true;
+          revoked = authority !== "valid";
+          return Response.json({ deployment: deployment("u".repeat(32)) });
+        }
+        throw new Error("unexpected request");
+      });
+      const prepared = await capability.prepare(config(), lease());
+      // JSON round-trip models a retained legacy v1 plan/journal read without new publication evidence.
+      const plan = JSON.parse(JSON.stringify(prepared.plan));
+      delete plan.data.transport;
+      const step: ProvisioningStep = {
+        ...prepared.step,
+        phase: "cleanup",
+        state: { version: 1, action: "delete", serviceID, deploymentID },
+      };
+      const assertCleanupOwner = vi.fn<() => Promise<void>>(async () => {
+        expect(checkedRead).toBe(true);
+        if (revoked) throw new Error(`${authority} cleanup claim`);
+      });
+      const result = capability.advance({
+        plan,
+        step,
+        lease: lease({ providerScope: prepared.plan.scope }),
+        deadline: Date.now() - 1,
+        recovering: true,
+        canceled: true,
+        assertCleanupOwner: authority === "missing" ? undefined : assertCleanupOwner,
+      });
+      const outcome = await result.then(
+        (value) => ({ state: value.state }),
+        (error: Error) => ({ error: error.message }),
+      );
+      expect(outcome).toMatchObject(
+        authority === "valid"
+          ? { state: { action: "confirm-delete" } }
+          : {
+              error:
+                authority === "missing"
+                  ? "Koyeb cleanup requires current coordinator authority"
+                  : `${authority} cleanup claim`,
+            },
+      );
+      expect(checkedRead).toBe(true);
+      expect(cleanupDeletes(requests)).toHaveLength(authority === "valid" ? 1 : 0);
+      // The adapter returns new continuation state and leaves its input journal untouched.
+      expect(step.state).toMatchObject({ action: "delete" });
+    },
+  );
 });

@@ -45,6 +45,24 @@ interface KoyebConfiguration {
   appName?: string;
 }
 
+interface KoyebReleaseContext {
+  resourceIdentity?: string;
+  assertCleanupOwner?: () => Promise<void>;
+}
+
+interface KoyebCleanupIdentity {
+  schema: "crabbox-koyeb-cleanup/v1";
+  scope: string;
+  organizationID: string;
+  appID: string;
+  leaseID: string;
+  generation: string;
+  serviceID: string;
+  deploymentID: string;
+  ttlSeconds: number;
+  idleTimeoutSeconds: number;
+}
+
 interface KoyebService {
   id: string;
   name: string;
@@ -316,7 +334,10 @@ export class KoyebClient {
     }
   }
 
-  async ownedServiceForLease(lease: LeaseRecord): Promise<OwnedDeployment | undefined> {
+  async ownedServiceForLease(
+    lease: LeaseRecord,
+    resourceIdentity?: string,
+  ): Promise<OwnedDeployment | undefined> {
     const scope = await this.providerScope();
     if (
       lease.provider !== "koyeb" ||
@@ -330,18 +351,23 @@ export class KoyebClient {
     }
     const service = await this.getService(lease.cloudID);
     if (!service) return undefined;
-    const plan = planForLeaseCleanup(this, lease);
+    const identity = cleanupIdentity(this, lease, resourceIdentity);
+    if (service.id !== identity.serviceID) {
+      throw new ProviderResourceUnresolvedError("Koyeb lease cleanup resource identity changed");
+    }
+    const plan = planForLeaseCleanup(this, lease, identity);
     const observation = await observeService(this, plan, service);
     if (observation.kind === "missing") return undefined;
-    if (observation.kind !== "owned") {
+    if (observation.kind !== "owned" || observation.value.deployment.id !== identity.deploymentID) {
       throw new ProviderResourceUnresolvedError("Koyeb lease cleanup ownership is not proven");
     }
     return observation.value;
   }
 
-  async deleteOwnedService(lease: LeaseRecord): Promise<void> {
-    const owned = await this.ownedServiceForLease(lease);
+  async deleteOwnedService(lease: LeaseRecord, context?: KoyebReleaseContext): Promise<void> {
+    const owned = await this.ownedServiceForLease(lease, context?.resourceIdentity);
     if (!owned) return;
+    await assertKoyebCleanupOwner(context?.assertCleanupOwner);
     await this.deleteService(owned.service.id);
     const observed = await this.getService(owned.service.id);
     if (observed && observed.status !== "DELETED") {
@@ -778,7 +804,21 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
         : { ...ownershipLabels(plan), koyeb_network: "mesh" };
     const result = output("ready-to-publish", 1);
     result.publication = {
-      server: machineForService(owned.service, plan, ready.host, labels),
+      server: {
+        ...machineForService(owned.service, plan, ready.host, labels),
+        resourceIdentity: JSON.stringify({
+          schema: "crabbox-koyeb-cleanup/v1",
+          scope: input.plan.scope,
+          organizationID: plan.organizationID,
+          appID: plan.appID,
+          leaseID: plan.leaseID,
+          generation: plan.generation,
+          serviceID: owned.service.id,
+          deploymentID: owned.deployment.id,
+          ttlSeconds: plan.ttlSeconds,
+          idleTimeoutSeconds: plan.idleTimeoutSeconds,
+        } satisfies KoyebCleanupIdentity),
+      },
       serverType: plan.instanceType,
       market: "on-demand",
       access: {
@@ -842,6 +882,8 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
             : { blockedReason: "identity_resolution_required" }),
         };
       }
+      // A revoked owner must not advance the journal to confirm-delete.
+      await assertKoyebCleanupOwner(input.assertCleanupOwner);
       try {
         await this.client.deleteService(state.serviceID);
       } finally {
@@ -1539,7 +1581,57 @@ function machineForService(
   };
 }
 
-function planForLeaseCleanup(client: KoyebClient, lease: LeaseRecord): KoyebProvisioningPlan {
+async function assertKoyebCleanupOwner(assertOwner?: () => Promise<void>): Promise<void> {
+  if (!assertOwner) {
+    throw new ProviderResourceUnresolvedError(
+      "Koyeb cleanup requires current coordinator authority",
+    );
+  }
+  await assertOwner();
+}
+
+function cleanupIdentity(
+  client: KoyebClient,
+  lease: LeaseRecord,
+  value?: string,
+): KoyebCleanupIdentity {
+  let identity: JSONRecord = {};
+  if (typeof value === "string" && value.length <= 4096) {
+    try {
+      identity = asObject(JSON.parse(value));
+    } catch {
+      // Missing or malformed retained evidence cannot authorize an existing service.
+    }
+  }
+  if (
+    identity["schema"] !== "crabbox-koyeb-cleanup/v1" ||
+    identity["scope"] !== lease.providerScope ||
+    identity["organizationID"] !== client.organizationID ||
+    identity["appID"] !== client.appID ||
+    identity["leaseID"] !== lease.id ||
+    identity["generation"] !== lease.createAttemptGeneration ||
+    identity["serviceID"] !== lease.cloudID ||
+    !uuidPattern.test(stringValue(identity["deploymentID"])) ||
+    ![identity["ttlSeconds"], identity["idleTimeoutSeconds"]].every(
+      (seconds) =>
+        typeof seconds === "number" &&
+        Number.isSafeInteger(seconds) &&
+        seconds > 0 &&
+        seconds <= 86_400,
+    )
+  ) {
+    throw new ProviderResourceUnresolvedError(
+      "Koyeb lease cleanup allocation identity is missing or inconsistent",
+    );
+  }
+  return identity as unknown as KoyebCleanupIdentity;
+}
+
+function planForLeaseCleanup(
+  client: KoyebClient,
+  lease: LeaseRecord,
+  identity: KoyebCleanupIdentity,
+): KoyebProvisioningPlan {
   const image = lease.image;
   const region = lease.region;
   if (
@@ -1577,8 +1669,8 @@ function planForLeaseCleanup(client: KoyebClient, lease: LeaseRecord): KoyebProv
     owner: lease.providerOwner || lease.owner,
     org: lease.org,
     generation: lease.createAttemptGeneration!,
-    ttlSeconds: lease.ttlSeconds,
-    idleTimeoutSeconds: lease.idleTimeoutSeconds ?? lease.ttlSeconds,
+    ttlSeconds: identity.ttlSeconds,
+    idleTimeoutSeconds: identity.idleTimeoutSeconds,
     sshPublicKey: "cleanup-only",
     transport,
     ...(privateHost ? { privateHost } : {}),

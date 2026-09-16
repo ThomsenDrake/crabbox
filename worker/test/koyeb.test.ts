@@ -209,31 +209,16 @@ function capacityDeployment(
   };
 }
 
-function capacityInstance(
-  id: string,
-  targetServiceID: string,
-  targetAppID: string,
-  overrides: Record<string, unknown> = {},
-) {
-  return {
-    id,
-    organization_id: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
-    app_id: targetAppID,
-    service_id: targetServiceID,
-    type: "large",
-    status: "HEALTHY",
-    ...overrides,
-  };
-}
-
 function capacityFixture(
   options: {
     quotas?: Record<string, unknown>;
+    quotaUsage?: Record<string, unknown>;
     services?: Array<Record<string, unknown>>;
+    appServices?: Record<string, Array<Record<string, unknown>>>;
     deployments?: Array<Record<string, unknown>>;
-    instances?: Array<Record<string, unknown>>;
     appNames?: Record<string, string>;
     catalogMemory?: Record<string, string>;
+    serviceInventoryGate?: Promise<void>;
   } = {},
 ) {
   const requests: Request[] = [];
@@ -242,6 +227,12 @@ function capacityFixture(
     [secondAppID]: secondAppName,
     [thirdAppID]: thirdAppName,
   };
+  const organizationServiceLimit = Number(options.quotas?.["services"] ?? 1000);
+  const organizationMemoryLimit = Number(options.quotas?.["memory_mb"] ?? 548576);
+  const workerInstanceLimit = Number(
+    (options.quotas?.["max_instances_by_type"] as Record<string, unknown> | undefined)?.["large"] ??
+      0,
+  );
   const fetcher = vi.fn<typeof fetch>(async (request) => {
     const incoming = request instanceof Request ? request.clone() : new Request(request);
     requests.push(incoming.clone());
@@ -270,34 +261,43 @@ function capacityFixture(
         },
       });
     }
-    if (url.pathname === "/v1/services") {
-      const services = options.services ?? [];
+    if (url.pathname.includes("/v1/quotas/organizations/") && url.pathname.endsWith("/usage")) {
       return Response.json({
-        services,
+        usage: {
+          services_used: 0,
+          services_limit: organizationServiceLimit,
+          memory_mb_used: 0,
+          memory_mb_limit: organizationMemoryLimit,
+          instances_by_type: [{ instance_type: "large", used: 0, limit: workerInstanceLimit }],
+          ...options.quotaUsage,
+        },
+      });
+    }
+    if (url.pathname === "/v1/services") {
+      await options.serviceInventoryGate;
+      const appID = url.searchParams.get("app_id");
+      const services = appID
+        ? (options.appServices?.[appID] ??
+          (options.services ?? []).filter((entry) => entry["app_id"] === appID))
+        : (options.services ?? []);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      return Response.json({
+        services: services.slice(offset, offset + 100),
         count: services.length,
-        offset: 0,
+        offset,
         limit: 100,
-        has_next: false,
+        has_next: offset + 100 < services.length,
       });
     }
     if (url.pathname === "/v1/deployments") {
       const deployments = options.deployments ?? [];
+      const offset = Number(url.searchParams.get("offset") ?? 0);
       return Response.json({
-        deployments,
+        deployments: deployments.slice(offset, offset + 100),
         count: deployments.length,
-        offset: 0,
+        offset,
         limit: 100,
-        has_next: false,
-      });
-    }
-    if (url.pathname === "/v1/instances") {
-      const instances = options.instances ?? [];
-      return Response.json({
-        instances,
-        count: instances.length,
-        offset: 0,
-        limit: 100,
-        has_next: false,
+        has_next: offset + 100 < deployments.length,
       });
     }
     if (url.pathname.startsWith("/v1/catalog/instances/")) {
@@ -985,6 +985,31 @@ describe("Koyeb service inventory", () => {
     expect(requests.every((request) => request.method === "GET")).toBe(true);
   });
 
+  it("collects every direct app service page without a type filter", async () => {
+    const inventory = inventoryServices(101);
+    const requests: Request[] = [];
+    const client = new KoyebClient(baseEnv, async (request) => {
+      const incoming = request instanceof Request ? request : new Request(request);
+      requests.push(incoming);
+      const offset = Number(new URL(incoming.url).searchParams.get("offset"));
+      return Response.json({
+        services: inventory.slice(offset, offset + 100),
+        limit: 100,
+        offset,
+        count: inventory.length,
+        has_next: offset === 0,
+      });
+    });
+
+    await expect(client.listAllServices()).resolves.toHaveLength(101);
+    expect(
+      requests.map((request) => Object.fromEntries(new URL(request.url).searchParams)),
+    ).toEqual([
+      { app_id: baseEnv.CRABBOX_KOYEB_APP_ID, limit: "100", offset: "0" },
+      { app_id: baseEnv.CRABBOX_KOYEB_APP_ID, limit: "100", offset: "100" },
+    ]);
+  });
+
   it("uses the total count and consumed items to advance through short pages", async () => {
     const inventory = inventoryServices(3);
     const offsets: string[] = [];
@@ -1183,7 +1208,7 @@ describe("Koyeb managed app targets", () => {
     ).toContain("CRABBOX_KOYEB_APP_TARGETS");
   });
 
-  it("counts every service type and exposes thirty worker slots across two apps", async () => {
+  it("uses aggregate quota usage to expose thirty worker slots beside a database", async () => {
     const env = managedAppPoolEnv();
     const firstServiceID = "77777777-7777-4777-8777-777777777777";
     const secondServiceID = "88888888-8888-4888-8888-888888888888";
@@ -1199,17 +1224,34 @@ describe("Koyeb managed app targets", () => {
       }),
       service({
         id: secondServiceID,
-        name: "background-worker",
-        type: "WORKER",
+        name: "postgres",
+        type: "DATABASE",
         active_deployment_id: secondDeploymentID,
         latest_deployment_id: secondDeploymentID,
       }),
     ];
     const { fetcher, requests } = capacityFixture({
+      quotaUsage: {
+        services_used: 170,
+        services_limit: 1000,
+        memory_mb_used: 222856,
+        memory_mb_limit: 548576,
+        instances_by_type: [{ instance_type: "large", used: 12, limit: 0 }],
+      },
       services: baselineServices,
       deployments: [
         capacityDeployment(firstDeploymentID, firstServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
-        capacityDeployment(secondDeploymentID, secondServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        capacityDeployment(secondDeploymentID, secondServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!, {
+          definition: {
+            type: "DATABASE",
+            database: {
+              neon_postgres: {
+                region: "aws-us-east-1",
+                instance_type: "small",
+              },
+            },
+          },
+        }),
       ],
     });
     const capability = new KoyebResumableProvisioning(env, fetcher);
@@ -1217,14 +1259,19 @@ describe("Koyeb managed app targets", () => {
     const candidates = prepared.candidates!;
 
     expect(candidates).toHaveLength(2);
+    expect((candidates[0]!.plan.data as any).capacity).toMatchObject({
+      organizationServicesUsed: 170,
+      organizationMemoryMBUsed: 222856,
+      workerInstancesUsed: 12,
+      workerMemoryMB: 4096,
+      observedProvisioningServiceIDs: [],
+    });
     expect(
       requests
         .map((request) => new URL(request.url))
         .filter((request) => request.pathname === "/v1/services")
-        .every(
-          (request) => !request.searchParams.has("types") && !request.searchParams.has("app_id"),
-        ),
-    ).toBe(true);
+        .map((request) => request.searchParams.get("app_id")),
+    ).toEqual([null, baseEnv.CRABBOX_KOYEB_APP_ID, secondAppID]);
     expect(
       candidates.map((candidate) => ({
         appID: candidate.lease.providerProject,
@@ -1267,7 +1314,71 @@ describe("Koyeb managed app targets", () => {
     ).rejects.toThrow("Koyeb organization capacity is exhausted");
     expect(
       requests.filter((request) => new URL(request.url).pathname === "/v1/services"),
-    ).toHaveLength(1);
+    ).toHaveLength(3);
+  });
+
+  it("does not replace aggregate service usage with a shorter organization inventory", async () => {
+    const services = Array.from({ length: 134 }, (_, index) => {
+      const suffix = (index + 1).toString(16).padStart(12, "0");
+      return service({
+        id: `70000000-0000-4000-8000-${suffix}`,
+        app_id: thirdAppID,
+        active_deployment_id: `80000000-0000-4000-8000-${suffix}`,
+        latest_deployment_id: `80000000-0000-4000-8000-${suffix}`,
+      });
+    });
+    const deployments = services.map((entry, index) =>
+      capacityDeployment(
+        `80000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+        String(entry.id),
+        thirdAppID,
+      ),
+    );
+    const { candidates } = await managedCapacityCandidates({
+      quotaUsage: { services_used: 170 },
+      services,
+      deployments,
+    });
+    const capacity = (candidates[0]!.plan.data as any).capacity;
+
+    expect(capacity.observedOrganizationServiceIDs).toHaveLength(134);
+    expect(capacity.organizationServicesUsed).toBe(170);
+  });
+
+  it("expires only the local reuse window for an aggregate snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-16T02:17:48.000Z"));
+    const { capability, candidates } = await managedCapacityCandidates();
+    vi.setSystemTime(new Date("2026-09-16T02:18:48.001Z"));
+
+    await expect(
+      capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
+    ).rejects.toThrow("Koyeb organization capacity snapshot is stale");
+  });
+
+  it("ages the snapshot from quota receipt while later inventory is deferred", async () => {
+    let now = Date.parse("2026-09-16T02:17:48.000Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let releaseInventory!: () => void;
+    const serviceInventoryGate = new Promise<void>((resolve) => {
+      releaseInventory = resolve;
+    });
+    const fixture = capacityFixture({ serviceInventoryGate });
+    const capability = new KoyebResumableProvisioning(managedAppPoolEnv(), fixture.fetcher);
+    const preparedPromise = capability.prepare(meshConfig(), lease());
+    await vi.waitFor(() => {
+      expect(
+        fixture.requests.some((request) => new URL(request.url).pathname.endsWith("/usage")),
+      ).toBe(true);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    now = Date.parse("2026-09-16T02:18:48.001Z");
+    releaseInventory();
+    const prepared = await preparedPromise;
+
+    await expect(
+      capability.selectAdmission(new ProvisioningTestStorage(), prepared.candidates!, lease()),
+    ).rejects.toThrow("Koyeb organization capacity snapshot is stale");
   });
 
   it.each([
@@ -1292,7 +1403,7 @@ describe("Koyeb managed app targets", () => {
     ).rejects.toThrow("excluded by organization quota");
   });
 
-  it("fails closed on incomplete service, deployment, instance, and catalog usage evidence", async () => {
+  it("fails closed on incomplete service, deployment, and catalog evidence", async () => {
     const capacityServiceID = "77777777-7777-4777-8777-777777777777";
     const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const cases: Array<{
@@ -1324,39 +1435,6 @@ describe("Koyeb managed app targets", () => {
         message: "service deployment inventory is inconsistent",
       },
       {
-        options: {
-          services: [
-            service({
-              id: capacityServiceID,
-              active_deployment_id: capacityDeploymentID,
-              latest_deployment_id: capacityDeploymentID,
-            }),
-          ],
-          deployments: [
-            capacityDeployment(
-              capacityDeploymentID,
-              capacityServiceID,
-              baseEnv.CRABBOX_KOYEB_APP_ID!,
-              { definition: { regions: ["was"], instance_types: [{ type: "large" }] } },
-            ),
-          ],
-        },
-        message: "deployment capacity definition is incomplete",
-      },
-      {
-        options: {
-          instances: [
-            capacityInstance(
-              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-              capacityServiceID,
-              baseEnv.CRABBOX_KOYEB_APP_ID!,
-              { status: "UNKNOWN" },
-            ),
-          ],
-        },
-        message: "instance inventory is malformed",
-      },
-      {
         options: { catalogMemory: { large: "unknown" } },
         message: "instance catalog memory is malformed",
       },
@@ -1367,106 +1445,89 @@ describe("Koyeb managed app targets", () => {
     }
   });
 
-  it("fails closed for a production-shaped DATABASE deployment with unresolved memory quota participation", async () => {
-    const databaseServiceID = "77777777-7777-4777-8777-777777777777";
-    const databaseDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  it.each([
+    ["string service counter", { services_used: "170" }, "quota usage is incomplete"],
+    ["negative memory counter", { memory_mb_used: -1 }, "quota usage is incomplete"],
+    ["missing worker type", { instances_by_type: [] }, "configured instance type usage is missing"],
+    [
+      "duplicate worker type",
+      {
+        instances_by_type: [
+          { instance_type: "large", used: 1, limit: 0 },
+          { instance_type: "large", used: 1, limit: 0 },
+        ],
+      },
+      "instance type usage is malformed",
+    ],
+  ])("fails closed on malformed aggregate %s", async (_label, quotaUsage, message) => {
+    await expect(managedCapacityCandidates({ quotaUsage })).rejects.toThrow(message);
+  });
+
+  it.each([
+    ["service", { services_limit: 999 }],
+    ["memory", { memory_mb_limit: 548575 }],
+    ["instance type", { instances_by_type: [{ instance_type: "large", used: 0, limit: 1 }] }],
+  ])("fails closed when aggregate %s limits disagree", async (_label, quotaUsage) => {
+    await expect(managedCapacityCandidates({ quotaUsage })).rejects.toThrow(
+      "Koyeb organization quota limits are inconsistent",
+    );
+  });
+
+  it("rejects an app-scoped service response with the wrong target identity", async () => {
+    await expect(
+      managedCapacityCandidates({
+        appServices: {
+          [baseEnv.CRABBOX_KOYEB_APP_ID!]: [service({ app_id: secondAppID })],
+          [secondAppID]: [],
+        },
+      }),
+    ).rejects.toThrow("Koyeb app service inventory is malformed");
+  });
+
+  it("rejects conflicting global and direct app bindings for one service ID", async () => {
+    const sharedServiceID = "77777777-7777-4777-8777-777777777777";
+    const globalDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const directDeploymentID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
     await expect(
       managedCapacityCandidates({
         services: [
           service({
-            id: databaseServiceID,
-            name: "postgres",
-            type: "DATABASE",
-            active_deployment_id: databaseDeploymentID,
-            latest_deployment_id: databaseDeploymentID,
+            id: sharedServiceID,
+            app_id: secondAppID,
+            active_deployment_id: globalDeploymentID,
+            latest_deployment_id: globalDeploymentID,
           }),
         ],
+        appServices: {
+          [baseEnv.CRABBOX_KOYEB_APP_ID!]: [
+            service({
+              id: sharedServiceID,
+              active_deployment_id: directDeploymentID,
+              latest_deployment_id: directDeploymentID,
+            }),
+          ],
+          [secondAppID]: [],
+        },
         deployments: [
-          capacityDeployment(
-            databaseDeploymentID,
-            databaseServiceID,
-            baseEnv.CRABBOX_KOYEB_APP_ID!,
-            {
-              definition: {
-                type: "DATABASE",
-                database: {
-                  neon_postgres: {
-                    pg_version: 16,
-                    region: "aws-eu-central-1",
-                    instance_type: "free",
-                    roles: [],
-                    databases: [],
-                  },
-                },
-              },
-            },
-          ),
+          capacityDeployment(globalDeploymentID, sharedServiceID, secondAppID),
+          capacityDeployment(directDeploymentID, sharedServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
         ],
       }),
-    ).rejects.toThrow("Koyeb database memory quota participation is unresolved");
+    ).rejects.toThrow("Koyeb app service inventory conflicts with organization inventory");
   });
 
-  it.each([
-    ["global scaling across both deployment regions", [{ min: 1, max: 1, targets: [] }]],
-    [
-      "region-scoped scaling across both deployment regions",
-      [
-        { scopes: ["region:was"], min: 1, max: 1, targets: [] },
-        { scopes: ["region:fra"], min: 1, max: 1, targets: [] },
-      ],
-    ],
-  ])("reserves memory for %s", async (_label, scalings) => {
-    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
-    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  it("keeps an explicit zero instance-type quota fail closed", async () => {
     const { capability, candidates } = await managedCapacityCandidates({
-      quotas: { memory_mb: "8192" },
-      services: [
-        service({
-          id: capacityServiceID,
-          active_deployment_id: capacityDeploymentID,
-          latest_deployment_id: capacityDeploymentID,
-        }),
-      ],
-      deployments: [
-        capacityDeployment(capacityDeploymentID, capacityServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!, {
-          definition: {
-            regions: ["was", "fra"],
-            instance_types: [{ type: "large" }],
-            scalings,
-          },
-        }),
-      ],
+      quotas: { max_instances_by_type: { large: "0" } },
+      quotaUsage: {
+        instances_by_type: [{ instance_type: "large", used: 12, limit: 0 }],
+      },
     });
 
     await expect(
       capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
     ).rejects.toThrow("Koyeb organization capacity is exhausted");
-  });
-
-  it("fails closed when a deployment has no scaling capacity evidence", async () => {
-    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
-    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-
-    await expect(
-      managedCapacityCandidates({
-        services: [
-          service({
-            id: capacityServiceID,
-            active_deployment_id: capacityDeploymentID,
-            latest_deployment_id: capacityDeploymentID,
-          }),
-        ],
-        deployments: [
-          capacityDeployment(
-            capacityDeploymentID,
-            capacityServiceID,
-            baseEnv.CRABBOX_KOYEB_APP_ID!,
-            { definition: { regions: ["was"], instance_types: [{ type: "large" }], scalings: [] } },
-          ),
-        ],
-      }),
-    ).rejects.toThrow("Koyeb deployment capacity definition is incomplete");
   });
 
   it.each([
@@ -1478,8 +1539,16 @@ describe("Koyeb managed app targets", () => {
     const capacityServiceID = "77777777-7777-4777-8777-777777777777";
     const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const provisioning = constraint === "provisioning concurrency";
+    const quotaUsage = {
+      ...(constraint === "organization services" ? { services_used: 1 } : {}),
+      ...(constraint === "memory" ? { memory_mb_used: 4096 } : {}),
+      ...(constraint === "instance type"
+        ? { instances_by_type: [{ instance_type: "large", used: 1, limit: 1 }] }
+        : {}),
+    };
     const { capability, candidates } = await managedCapacityCandidates({
       quotas: quotas as Record<string, unknown>,
+      quotaUsage,
       services: [
         service({
           id: capacityServiceID,
@@ -1501,57 +1570,32 @@ describe("Koyeb managed app targets", () => {
   });
 
   it.each([
-    [
-      "scaled service without an instance",
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      [
-        capacityDeployment(
-          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-          "77777777-7777-4777-8777-777777777777",
-          baseEnv.CRABBOX_KOYEB_APP_ID!,
-          {
-            definition: {
-              regions: ["was"],
-              instance_types: [{ type: "large" }],
-              scalings: [{ max: 2 }],
-            },
-          },
-        ),
-      ],
-    ],
-    [
-      "active and pending replacement deployments",
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-      [
-        capacityDeployment(
-          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-          "77777777-7777-4777-8777-777777777777",
-          baseEnv.CRABBOX_KOYEB_APP_ID!,
-        ),
-        capacityDeployment(
-          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-          "77777777-7777-4777-8777-777777777777",
-          baseEnv.CRABBOX_KOYEB_APP_ID!,
-          { status: "PROVISIONING" },
-        ),
-      ],
-    ],
+    ["service status", "STARTING", "HEALTHY"],
+    ["deployment status", "HEALTHY", "STARTING"],
   ])(
-    "reserves memory for %s",
-    async (_label, activeDeploymentID, replacementDeploymentID, deployments) => {
-      const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+    "counts direct-only provisioning from %s",
+    async (_source, serviceStatus, deploymentStatus) => {
+      const directServiceID = "77777777-7777-4777-8777-777777777777";
+      const directDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       const { capability, candidates } = await managedCapacityCandidates({
-        quotas: { memory_mb: "8192" },
-        services: [
-          service({
-            id: capacityServiceID,
-            active_deployment_id: activeDeploymentID,
-            latest_deployment_id: replacementDeploymentID,
+        quotas: { service_provisioning_concurrency: "1" },
+        services: [],
+        appServices: {
+          [baseEnv.CRABBOX_KOYEB_APP_ID!]: [
+            service({
+              id: directServiceID,
+              status: serviceStatus,
+              active_deployment_id: directDeploymentID,
+              latest_deployment_id: directDeploymentID,
+            }),
+          ],
+          [secondAppID]: [],
+        },
+        deployments: [
+          capacityDeployment(directDeploymentID, directServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!, {
+            status: deploymentStatus,
           }),
         ],
-        deployments: deployments as Array<Record<string, unknown>>,
       });
 
       await expect(
@@ -1560,23 +1604,59 @@ describe("Koyeb managed app targets", () => {
     },
   );
 
-  it("keeps an unterminated ERROR instance in memory and type capacity", async () => {
-    const { capability, candidates } = await managedCapacityCandidates({
-      quotas: { memory_mb: "4096", max_instances_by_type: { large: "1" } },
-      instances: [
-        capacityInstance(
-          "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-          "77777777-7777-4777-8777-777777777777",
-          baseEnv.CRABBOX_KOYEB_APP_ID!,
-          { status: "ERROR" },
-        ),
-      ],
-    });
-
+  it("fails closed when a direct-only service deployment is omitted", async () => {
     await expect(
-      capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
-    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+      managedCapacityCandidates({
+        services: [],
+        appServices: {
+          [baseEnv.CRABBOX_KOYEB_APP_ID!]: [service()],
+          [secondAppID]: [],
+        },
+        deployments: [],
+      }),
+    ).rejects.toThrow("Koyeb service deployment inventory is inconsistent");
   });
+
+  it.each([
+    ["service", { services: "2" }, { services_used: 1 }],
+    ["memory", { memory_mb: "8192" }, { memory_mb_used: 4096 }],
+    [
+      "instance type",
+      { max_instances_by_type: { large: "2" } },
+      { instances_by_type: [{ instance_type: "large", used: 1, limit: 2 }] },
+    ],
+  ])(
+    "always overlays a visible durable lease on cached aggregate %s usage",
+    async (_dimension, quotas, quotaUsage) => {
+      const targetServiceID = "77777777-7777-4777-8777-777777777777";
+      const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const { capability, candidates } = await managedCapacityCandidates({
+        quotas,
+        quotaUsage,
+        services: [
+          service({
+            id: targetServiceID,
+            active_deployment_id: targetDeploymentID,
+            latest_deployment_id: targetDeploymentID,
+          }),
+        ],
+        deployments: [
+          capacityDeployment(targetDeploymentID, targetServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        ],
+      });
+      const storage = new ProvisioningTestStorage();
+      const reservation = lease({
+        ...candidates[0]!.lease,
+        state: "active",
+        cloudID: targetServiceID,
+      });
+      await storage.put(`lease:${reservation.id}`, reservation);
+
+      await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+        "Koyeb organization capacity is exhausted",
+      );
+    },
+  );
 
   it("serializes simultaneous admissions against durable unobserved reservations", async () => {
     const { capability, candidates } = await managedCapacityCandidates({
@@ -1781,6 +1861,84 @@ describe("Koyeb managed app targets", () => {
         region: candidates[0]!.lease.region,
       }),
     );
+
+    await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+      "Koyeb durable lease service identity does not match its target app",
+    );
+  });
+
+  it("uses direct app membership when organization inventory omits a bound service", async () => {
+    const targetServiceID = "77777777-7777-4777-8777-777777777777";
+    const firstServiceID = "11111111-1111-4111-8111-111111111112";
+    const secondServiceID = "11111111-1111-4111-8111-111111111113";
+    const firstDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const secondDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+    const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: { services_by_app: "2" },
+      appServices: {
+        [baseEnv.CRABBOX_KOYEB_APP_ID!]: [
+          service({
+            id: firstServiceID,
+            active_deployment_id: firstDeploymentID,
+            latest_deployment_id: firstDeploymentID,
+          }),
+          service({
+            id: secondServiceID,
+            active_deployment_id: secondDeploymentID,
+            latest_deployment_id: secondDeploymentID,
+          }),
+        ],
+        [secondAppID]: [
+          service({
+            id: targetServiceID,
+            app_id: secondAppID,
+            active_deployment_id: targetDeploymentID,
+            latest_deployment_id: targetDeploymentID,
+          }),
+        ],
+      },
+      deployments: [
+        capacityDeployment(firstDeploymentID, firstServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        capacityDeployment(secondDeploymentID, secondServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        capacityDeployment(targetDeploymentID, targetServiceID, secondAppID),
+      ],
+    });
+    const storage = new ProvisioningTestStorage();
+    const reservation = lease({
+      ...candidates[1]!.lease,
+      state: "active",
+      cloudID: targetServiceID,
+    });
+    await storage.put(`lease:${reservation.id}`, reservation);
+
+    await expect(capability.selectAdmission(storage, candidates, lease())).resolves.toBe(1);
+  });
+
+  it("rejects direct app membership in a different frozen target", async () => {
+    const targetServiceID = "77777777-7777-4777-8777-777777777777";
+    const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const { capability, candidates } = await managedCapacityCandidates({
+      appServices: {
+        [baseEnv.CRABBOX_KOYEB_APP_ID!]: [],
+        [secondAppID]: [
+          service({
+            id: targetServiceID,
+            app_id: secondAppID,
+            active_deployment_id: targetDeploymentID,
+            latest_deployment_id: targetDeploymentID,
+          }),
+        ],
+      },
+      deployments: [capacityDeployment(targetDeploymentID, targetServiceID, secondAppID)],
+    });
+    const storage = new ProvisioningTestStorage();
+    const reservation = lease({
+      ...candidates[0]!.lease,
+      state: "active",
+      cloudID: targetServiceID,
+    });
+    await storage.put(`lease:${reservation.id}`, reservation);
 
     await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
       "Koyeb durable lease service identity does not match its target app",

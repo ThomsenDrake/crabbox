@@ -39,6 +39,8 @@ export const koyebPoolBootstrap = "clean-runner-v1";
 const pollInterval = 2_000;
 // An explicit coordinator observation budget, independent of any CLI/RPC deadline.
 const deletionConfirmationBudgetMs = 5 * 60_000;
+const koyebQuotaUsageCacheSeconds = 60;
+const capacitySnapshotLocalReuseMs = koyebQuotaUsageCacheSeconds * 1_000;
 const serviceStatuses = new Set([
   "STARTING",
   "HEALTHY",
@@ -70,16 +72,6 @@ const deploymentStatuses = new Set([
   "STOPPED",
   "ERROR",
   "STASHED",
-  "SLEEPING",
-]);
-const instanceStatuses = new Set([
-  "ALLOCATING",
-  "STARTING",
-  "HEALTHY",
-  "UNHEALTHY",
-  "STOPPING",
-  "STOPPED",
-  "ERROR",
   "SLEEPING",
 ]);
 const uuidPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -115,32 +107,34 @@ interface KoyebCapacitySnapshot {
   organizationServices: number;
   serviceProvisioningConcurrency: number;
   memoryMB: number;
+  snapshotCapturedAt: number;
   observedServiceIDs: string[];
+  observedAppProvisioningServiceIDs: string[];
   observedOrganizationServiceIDs: string[];
-  observedOrganizationServiceCount: number;
+  organizationServicesUsed: number;
   observedProvisioningServiceIDs: string[];
-  observedMemoryMB: number;
-  memoryAccountedServiceIDs: string[];
-  observedWorkerInstanceCount: number;
-  workerInstanceAccountedServiceIDs: string[];
+  organizationMemoryMBUsed: number;
+  workerInstancesUsed: number;
   workerInstanceLimit?: number;
   workerMemoryMB: number;
 }
 
-interface KoyebInstance {
-  id: string;
-  organizationID: string;
-  appID: string;
-  serviceID: string;
-  type: string;
-  status: string;
-}
-
 interface KoyebOrganizationCapacitySnapshot extends Omit<
   KoyebCapacitySnapshot,
-  "observedServiceIDs"
+  "observedServiceIDs" | "observedAppProvisioningServiceIDs"
 > {
   services: KoyebService[];
+  deployments: KoyebDeployment[];
+}
+
+interface KoyebQuotaUsageSnapshot {
+  receivedAt: number;
+  servicesUsed: number;
+  servicesLimit: number;
+  memoryMBUsed: number;
+  memoryMBLimit: number;
+  workerInstancesUsed: number;
+  workerInstanceLimit: number;
 }
 
 interface KoyebService {
@@ -163,11 +157,6 @@ interface KoyebDeployment {
   status: string;
   definition: JSONRecord;
   metadata: JSONRecord;
-}
-
-interface KoyebDeploymentCapacityShape {
-  instanceTypes: string[];
-  maxReplicas: number;
 }
 
 interface KoyebProvisioningPlan {
@@ -452,6 +441,70 @@ export class KoyebClient {
     };
   }
 
+  private async quotaUsage(): Promise<KoyebQuotaUsageSnapshot> {
+    // Koyeb documents this response as cached for up to 60 seconds. The local
+    // capture timestamp only bounds coordinator reuse after this response; it
+    // does not establish provider-data age or atomicity with a later create.
+    const response = asObject(
+      await this.apiRequest(
+        "GET",
+        `/v1/quotas/organizations/${encodeURIComponent(this.organizationID)}/usage`,
+      ),
+    );
+    const receivedAt = Date.now();
+    const usage = asObject(response["usage"]);
+    const servicesUsed = usageInteger(usage, "services_used");
+    const servicesLimit = usageInteger(usage, "services_limit");
+    const memoryMBUsed = usageInteger(usage, "memory_mb_used");
+    const memoryMBLimit = usageInteger(usage, "memory_mb_limit");
+    const instancesByType = usage["instances_by_type"];
+    if (
+      servicesUsed === undefined ||
+      servicesLimit === undefined ||
+      memoryMBUsed === undefined ||
+      memoryMBLimit === undefined ||
+      servicesLimit <= 0 ||
+      memoryMBLimit <= 0 ||
+      !Array.isArray(instancesByType)
+    ) {
+      throw capacityEvidenceError("organization quota usage is incomplete");
+    }
+    const seen = new Set<string>();
+    let workerInstancesUsed: number | undefined;
+    let workerInstanceLimit: number | undefined;
+    for (const entry of instancesByType) {
+      const item = asObject(entry);
+      const instanceType = stringValue(item["instance_type"]);
+      const used = usageInteger(item, "used");
+      const limit = usageInteger(item, "limit");
+      if (
+        !validKoyebName(instanceType) ||
+        used === undefined ||
+        limit === undefined ||
+        seen.has(instanceType)
+      ) {
+        throw capacityEvidenceError("organization instance type usage is malformed");
+      }
+      seen.add(instanceType);
+      if (instanceType === this.instanceType) {
+        workerInstancesUsed = used;
+        workerInstanceLimit = limit;
+      }
+    }
+    if (workerInstancesUsed === undefined || workerInstanceLimit === undefined) {
+      throw capacityEvidenceError("configured instance type usage is missing");
+    }
+    return {
+      receivedAt,
+      servicesUsed,
+      servicesLimit,
+      memoryMBUsed,
+      memoryMBLimit,
+      workerInstancesUsed,
+      workerInstanceLimit,
+    };
+  }
+
   private async listOrganizationDeployments(): Promise<KoyebDeployment[]> {
     const limit = 100;
     const inventory: KoyebDeployment[] = [];
@@ -520,73 +573,6 @@ export class KoyebClient {
     }
   }
 
-  private async listOrganizationInstances(): Promise<KoyebInstance[]> {
-    const limit = 100;
-    const inventory: KoyebInstance[] = [];
-    const seen = new Set<string>();
-    let offset = 0;
-    let count: number | undefined;
-    for (;;) {
-      const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-      // oxlint-disable-next-line eslint/no-await-in-loop -- Each offset depends on the validated preceding page.
-      const value = asObject(await this.apiRequest("GET", `/v1/instances?${query.toString()}`));
-      const instances = value["instances"];
-      if (!Array.isArray(instances)) throw capacityEvidenceError("instance inventory is malformed");
-      const pageLimit = inventoryInteger(value, "limit", "instance") ?? limit;
-      const pageOffset = inventoryInteger(value, "offset", "instance");
-      const pageCount = inventoryInteger(value, "count", "instance");
-      const hasNext = value["has_next"];
-      if (
-        (hasNext !== undefined && typeof hasNext !== "boolean") ||
-        pageLimit === 0 ||
-        pageLimit > limit ||
-        instances.length > pageLimit ||
-        (pageOffset !== undefined && pageOffset !== offset) ||
-        (pageCount !== undefined && count !== undefined && pageCount !== count)
-      ) {
-        throw capacityEvidenceError("instance inventory pagination is malformed");
-      }
-      count = pageCount ?? count;
-      const nextOffset = offset + instances.length;
-      if (
-        !Number.isSafeInteger(nextOffset) ||
-        (count !== undefined &&
-          (count < nextOffset ||
-            (hasNext === true && count === nextOffset) ||
-            (hasNext === false && count > nextOffset)))
-      ) {
-        throw capacityEvidenceError("instance inventory pagination is inconsistent");
-      }
-      const more =
-        hasNext ?? (count !== undefined ? nextOffset < count : instances.length === pageLimit);
-      if (more && nextOffset <= offset) {
-        throw capacityEvidenceError("instance inventory pagination made no progress");
-      }
-      for (const entry of instances) {
-        const instance = koyebInstance(entry);
-        if (
-          !uuidPattern.test(instance.id) ||
-          !uuidPattern.test(instance.organizationID) ||
-          !uuidPattern.test(instance.appID) ||
-          !uuidPattern.test(instance.serviceID) ||
-          instance.organizationID !== this.organizationID ||
-          !validKoyebName(instance.type) ||
-          !instanceStatuses.has(instance.status)
-        ) {
-          throw capacityEvidenceError("instance inventory is malformed");
-        }
-        const id = instance.id.toLowerCase();
-        if (seen.has(id)) {
-          throw capacityEvidenceError("instance inventory contains repeated instance IDs");
-        }
-        seen.add(id);
-        inventory.push(instance);
-      }
-      if (!more) return inventory;
-      offset = nextOffset;
-    }
-  }
-
   private async catalogMemoryMB(instanceType: string): Promise<number> {
     const response = asObject(
       await this.apiRequest("GET", `/v1/catalog/instances/${encodeURIComponent(instanceType)}`),
@@ -604,12 +590,21 @@ export class KoyebClient {
     if (!this.managedTarget) {
       throw capacityEvidenceError("managed target capacity is unavailable");
     }
-    const [quotas, services, instances, deployments] = await Promise.all([
+    const [quotas, usage, services, deployments, workerMemoryMB] = await Promise.all([
       this.quotas(),
+      this.quotaUsage(),
       this.listOrganizationServices(),
-      this.listOrganizationInstances(),
       this.listOrganizationDeployments(),
+      this.catalogMemoryMB(this.instanceType),
     ]);
+    const expectedWorkerInstanceLimit = quotas.workerInstanceLimit ?? 0;
+    if (
+      usage.servicesLimit !== quotas.organizationServices ||
+      usage.memoryMBLimit !== quotas.memoryMB ||
+      usage.workerInstanceLimit !== expectedWorkerInstanceLimit
+    ) {
+      throw capacityEvidenceError("organization quota limits are inconsistent");
+    }
     if (
       services.some(
         (service) =>
@@ -619,159 +614,19 @@ export class KoyebClient {
       throw capacityEvidenceError("organization service inventory is malformed");
     }
     const liveServices = services.filter((service) => service.status !== "DELETED");
-    const servicesByID = new Map(
-      liveServices.map((service) => [service.id.toLowerCase(), service]),
-    );
-    const deploymentsByID = new Map(
-      deployments.map((deployment) => [deployment.id.toLowerCase(), deployment]),
-    );
-    const deploymentShapes = new Map<string, KoyebDeploymentCapacityShape>();
-    const provisioningServiceIDs = new Set(
-      liveServices
-        .filter((service) => provisioningServiceStatuses.has(service.status))
-        .map((service) => service.id.toLowerCase()),
-    );
-    for (const service of liveServices) {
-      const deploymentIDs = [service.activeDeploymentID, service.latestDeploymentID].filter(
-        (value, index, values): value is string =>
-          Boolean(value) && values.indexOf(value) === index,
-      );
-      if (deploymentIDs.length === 0 || deploymentIDs.some((id) => !uuidPattern.test(id))) {
-        throw capacityEvidenceError("service deployment identity is unresolved");
-      }
-      if (
-        service.activeDeploymentID &&
-        service.latestDeploymentID &&
-        service.activeDeploymentID !== service.latestDeploymentID
-      ) {
-        provisioningServiceIDs.add(service.id.toLowerCase());
-      }
-      for (const deploymentID of deploymentIDs) {
-        const deployment = deploymentsByID.get(deploymentID.toLowerCase());
-        if (
-          !deployment ||
-          deployment.id !== deploymentID ||
-          deployment.organizationID !== service.organizationID ||
-          deployment.appID !== service.appID ||
-          deployment.serviceID !== service.id
-        ) {
-          throw capacityEvidenceError("service deployment inventory is inconsistent");
-        }
-        const shape = deploymentCapacityShape(service, deployment);
-        deploymentShapes.set(deployment.id.toLowerCase(), shape);
-        if (provisioningDeploymentStatuses.has(deployment.status)) {
-          provisioningServiceIDs.add(service.id.toLowerCase());
-        }
-      }
-    }
-    // ListInstancesReply exposes InstanceListItem, which has no terminated_at.
-    // Every returned row remains reserved; status alone never proves memory release.
-    const reservedInstances = instances;
-    for (const instance of reservedInstances) {
-      const service = servicesByID.get(instance.serviceID.toLowerCase());
-      if (service && instance.appID !== service.appID) {
-        throw capacityEvidenceError("instance inventory does not match its service app");
-      }
-    }
-    const memoryByType = new Map<string, number>();
-    const deploymentTypes = [...deploymentShapes.values()].flatMap((shape) => shape.instanceTypes);
-    await Promise.all(
-      [
-        ...new Set([
-          ...reservedInstances.map((instance) => instance.type),
-          ...deploymentTypes,
-          this.instanceType,
-        ]),
-      ].map(async (instanceType) => {
-        memoryByType.set(instanceType, await this.catalogMemoryMB(instanceType));
-      }),
-    );
-    const actualMemoryByService = new Map<string, number>();
-    const actualWorkerInstancesByService = new Map<string, number>();
-    for (const instance of reservedInstances) {
-      const memoryMB = memoryByType.get(instance.type);
-      const serviceID = instance.serviceID.toLowerCase();
-      const next = (actualMemoryByService.get(serviceID) ?? 0) + (memoryMB ?? 0);
-      if (!memoryMB || !Number.isSafeInteger(next)) {
-        throw capacityEvidenceError("organization memory usage is unresolved");
-      }
-      actualMemoryByService.set(serviceID, next);
-      if (instance.type === this.instanceType) {
-        actualWorkerInstancesByService.set(
-          serviceID,
-          (actualWorkerInstancesByService.get(serviceID) ?? 0) + 1,
-        );
-      }
-    }
-    let observedMemoryMB = 0;
-    let observedWorkerInstanceCount = 0;
-    const memoryAccountedServiceIDs = new Set<string>();
-    const workerInstanceAccountedServiceIDs = new Set<string>();
-    for (const service of liveServices) {
-      const serviceID = service.id.toLowerCase();
-      const deploymentIDs = [service.activeDeploymentID, service.latestDeploymentID].filter(
-        (value, index, values): value is string =>
-          Boolean(value) && values.indexOf(value) === index,
-      );
-      let desiredMemoryMB = 0;
-      let desiredWorkerInstances = 0;
-      for (const deploymentID of deploymentIDs) {
-        const shape = deploymentShapes.get(deploymentID.toLowerCase())!;
-        const largestMemoryMB = Math.max(
-          ...shape.instanceTypes.map((instanceType) => memoryByType.get(instanceType) ?? 0),
-        );
-        const deploymentMemoryMB = largestMemoryMB * shape.maxReplicas;
-        if (!largestMemoryMB || !Number.isSafeInteger(deploymentMemoryMB)) {
-          throw capacityEvidenceError("deployment memory reservation is unresolved");
-        }
-        desiredMemoryMB += deploymentMemoryMB;
-        if (shape.instanceTypes.includes(this.instanceType)) {
-          desiredWorkerInstances += shape.maxReplicas;
-        }
-      }
-      const actualMemoryMB = actualMemoryByService.get(serviceID) ?? 0;
-      const serviceMemoryMB = Math.max(actualMemoryMB, desiredMemoryMB);
-      const actualWorkerInstances = actualWorkerInstancesByService.get(serviceID) ?? 0;
-      const serviceWorkerInstances = Math.max(actualWorkerInstances, desiredWorkerInstances);
-      if (
-        !Number.isSafeInteger(observedMemoryMB + serviceMemoryMB) ||
-        !Number.isSafeInteger(observedWorkerInstanceCount + serviceWorkerInstances)
-      ) {
-        throw capacityEvidenceError("organization capacity arithmetic overflowed");
-      }
-      observedMemoryMB += serviceMemoryMB;
-      observedWorkerInstanceCount += serviceWorkerInstances;
-      memoryAccountedServiceIDs.add(serviceID);
-      if (serviceWorkerInstances > 0) workerInstanceAccountedServiceIDs.add(serviceID);
-      actualMemoryByService.delete(serviceID);
-      actualWorkerInstancesByService.delete(serviceID);
-    }
-    for (const [serviceID, memoryMB] of actualMemoryByService) {
-      if (!Number.isSafeInteger(observedMemoryMB + memoryMB)) {
-        throw capacityEvidenceError("organization capacity arithmetic overflowed");
-      }
-      observedMemoryMB += memoryMB;
-      memoryAccountedServiceIDs.add(serviceID);
-    }
-    for (const [serviceID, count] of actualWorkerInstancesByService) {
-      if (!Number.isSafeInteger(observedWorkerInstanceCount + count)) {
-        throw capacityEvidenceError("organization capacity arithmetic overflowed");
-      }
-      observedWorkerInstanceCount += count;
-      workerInstanceAccountedServiceIDs.add(serviceID);
-    }
+    const provisioningServiceIDs = observedProvisioningServiceIDs(liveServices, deployments);
     const observedOrganizationServiceIDs = liveServices.map((service) => service.id);
     return {
       ...quotas,
-      services,
+      snapshotCapturedAt: usage.receivedAt,
       observedOrganizationServiceIDs,
-      observedOrganizationServiceCount: liveServices.length,
+      organizationServicesUsed: usage.servicesUsed,
       observedProvisioningServiceIDs: [...provisioningServiceIDs],
-      observedMemoryMB,
-      memoryAccountedServiceIDs: [...memoryAccountedServiceIDs],
-      observedWorkerInstanceCount,
-      workerInstanceAccountedServiceIDs: [...workerInstanceAccountedServiceIDs],
-      workerMemoryMB: memoryByType.get(this.instanceType)!,
+      organizationMemoryMBUsed: usage.memoryMBUsed,
+      workerInstancesUsed: usage.workerInstancesUsed,
+      workerMemoryMB,
+      services: liveServices,
+      deployments,
     };
   }
 
@@ -780,13 +635,38 @@ export class KoyebClient {
   ): Promise<KoyebCapacitySnapshot | undefined> {
     if (!this.managedTarget) return undefined;
     if (!organization) throw capacityEvidenceError("organization capacity evidence is missing");
-    await this.validateTarget();
-    const { services, ...snapshot } = organization;
+    const [, services] = await Promise.all([this.validateTarget(), this.listAllServices()]);
+    if (
+      services.some(
+        (service) =>
+          service.organizationID !== this.organizationID ||
+          service.appID !== this.appID ||
+          !serviceStatuses.has(service.status),
+      )
+    ) {
+      throw capacityEvidenceError("app service inventory is malformed");
+    }
+    const liveServices = services.filter((service) => service.status !== "DELETED");
+    const organizationServicesByID = new Map(
+      organization.services.map((service) => [service.id.toLowerCase(), service]),
+    );
+    if (
+      liveServices.some((service) => {
+        const organizationService = organizationServicesByID.get(service.id.toLowerCase());
+        return (
+          organizationService !== undefined &&
+          (organizationService.organizationID !== service.organizationID ||
+            organizationService.appID !== service.appID)
+        );
+      })
+    ) {
+      throw capacityEvidenceError("app service inventory conflicts with organization inventory");
+    }
+    const { deployments, services: _organizationServices, ...sharedCapacity } = organization;
     return {
-      ...snapshot,
-      observedServiceIDs: services
-        .filter((service) => service.status !== "DELETED" && service.appID === this.appID)
-        .map((service) => service.id),
+      ...sharedCapacity,
+      observedServiceIDs: liveServices.map((service) => service.id),
+      observedAppProvisioningServiceIDs: observedProvisioningServiceIDs(liveServices, deployments),
     };
   }
 
@@ -1477,22 +1357,25 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
         "Koyeb organization capacity evidence is inconsistent",
       );
     }
-    let organizationServices = baseline.observedOrganizationServiceCount;
-    let provisioningServices = baseline.observedProvisioningServiceIDs.length;
-    let memoryMB = baseline.observedMemoryMB;
-    let workerInstances = baseline.observedWorkerInstanceCount;
+    const snapshotAge = Date.now() - baseline.snapshotCapturedAt;
+    if (snapshotAge < 0 || snapshotAge > capacitySnapshotLocalReuseMs) {
+      throw new ProviderResourceUnresolvedError("Koyeb organization capacity snapshot is stale");
+    }
+    let organizationServices = baseline.organizationServicesUsed;
+    let memoryMB = baseline.organizationMemoryMBUsed;
+    let workerInstances = baseline.workerInstancesUsed;
     const observedOrganizationServices = new Set(
       baseline.observedOrganizationServiceIDs.map((id) => id.toLowerCase()),
     );
     const observedProvisioningServices = new Set(
       baseline.observedProvisioningServiceIDs.map((id) => id.toLowerCase()),
     );
-    const memoryAccountedServices = new Set(
-      baseline.memoryAccountedServiceIDs.map((id) => id.toLowerCase()),
-    );
-    const workerInstanceAccountedServices = new Set(
-      baseline.workerInstanceAccountedServiceIDs.map((id) => id.toLowerCase()),
-    );
+    for (const candidate of available) {
+      for (const serviceID of candidate.data.capacity!.observedAppProvisioningServiceIDs) {
+        observedProvisioningServices.add(serviceID.toLowerCase());
+      }
+    }
+    let provisioningServices = observedProvisioningServices.size;
     const reservations = [
       ...(await storage.list<LeaseRecord>({ prefix: "lease:" })).values(),
     ].filter((reservation) => reservation.provider === "koyeb");
@@ -1548,21 +1431,31 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
           "Koyeb durable lease service identity is invalid",
         );
       }
+      const directlyObservedTargets = serviceID
+        ? available.filter((candidate) =>
+            candidate.data.capacity!.observedServiceIDs.some(
+              (observedServiceID) => observedServiceID.toLowerCase() === serviceID,
+            ),
+          )
+        : [];
+      const observedInTargetApp =
+        directlyObservedTargets.length === 1 && directlyObservedTargets[0] === target;
       if (
         serviceID &&
-        observedOrganizationServices.has(serviceID) &&
-        !target.data.capacity!.observedServiceIDs.some(
-          (observedServiceID) => observedServiceID.toLowerCase() === serviceID,
-        )
+        !observedInTargetApp &&
+        (observedOrganizationServices.has(serviceID) || directlyObservedTargets.length > 0)
       ) {
         throw new ProviderResourceUnresolvedError(
           "Koyeb durable lease service identity does not match its target app",
         );
       }
-      if (!serviceID || !observedOrganizationServices.has(serviceID)) {
+      if (!serviceID || !observedInTargetApp) {
         target.headroom -= 1;
-        organizationServices += 1;
       }
+      // The aggregate usage response is cached and carries no resource membership
+      // or membership timestamp. Every unresolved durable lease is therefore
+      // overlaid conservatively, even when a visible service has the same ID.
+      organizationServices += 1;
       // Publication commits the active lease and terminal operation together.
       // Cancellation changes lease state before an uncertain create or cleanup
       // settles, so every other unresolved state retains its durable slot.
@@ -1571,12 +1464,8 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       if (reservation.state !== "active" && !observedProvisioningServices.has(serviceID)) {
         provisioningServices += 1;
       }
-      if (!serviceID || !memoryAccountedServices.has(serviceID)) {
-        memoryMB += baseline.workerMemoryMB;
-      }
-      if (!serviceID || !workerInstanceAccountedServices.has(serviceID)) {
-        workerInstances += 1;
-      }
+      memoryMB += baseline.workerMemoryMB;
+      workerInstances += 1;
     }
     if (
       organizationServices >= baseline.organizationServices ||
@@ -2086,23 +1975,22 @@ function validKoyebSecretName(value: string): boolean {
 function validCapacitySnapshot(value: KoyebCapacitySnapshot): boolean {
   if (
     !Array.isArray(value.observedServiceIDs) ||
+    !Array.isArray(value.observedAppProvisioningServiceIDs) ||
     !Array.isArray(value.observedOrganizationServiceIDs) ||
-    !Array.isArray(value.observedProvisioningServiceIDs) ||
-    !Array.isArray(value.memoryAccountedServiceIDs) ||
-    !Array.isArray(value.workerInstanceAccountedServiceIDs)
+    !Array.isArray(value.observedProvisioningServiceIDs)
   ) {
     return false;
   }
   const serviceIDs = [
     ...value.observedServiceIDs,
+    ...value.observedAppProvisioningServiceIDs,
     ...value.observedOrganizationServiceIDs,
     ...value.observedProvisioningServiceIDs,
-    ...value.memoryAccountedServiceIDs,
-    ...value.workerInstanceAccountedServiceIDs,
   ];
   const organizationServiceIDs = new Set(
     value.observedOrganizationServiceIDs.map((id) => id.toLowerCase()),
   );
+  const appServiceIDs = new Set(value.observedServiceIDs.map((id) => id.toLowerCase()));
   return (
     Number.isSafeInteger(value.servicesByApp) &&
     value.servicesByApp > 0 &&
@@ -2112,30 +2000,29 @@ function validCapacitySnapshot(value: KoyebCapacitySnapshot): boolean {
     value.serviceProvisioningConcurrency > 0 &&
     Number.isSafeInteger(value.memoryMB) &&
     value.memoryMB > 0 &&
-    Number.isSafeInteger(value.observedOrganizationServiceCount) &&
-    value.observedOrganizationServiceCount === value.observedOrganizationServiceIDs.length &&
-    Number.isSafeInteger(value.observedMemoryMB) &&
-    value.observedMemoryMB >= 0 &&
-    Number.isSafeInteger(value.observedWorkerInstanceCount) &&
-    value.observedWorkerInstanceCount >= 0 &&
+    Number.isSafeInteger(value.snapshotCapturedAt) &&
+    value.snapshotCapturedAt > 0 &&
+    Number.isSafeInteger(value.organizationServicesUsed) &&
+    value.organizationServicesUsed >= 0 &&
+    Number.isSafeInteger(value.organizationMemoryMBUsed) &&
+    value.organizationMemoryMBUsed >= 0 &&
+    Number.isSafeInteger(value.workerInstancesUsed) &&
+    value.workerInstancesUsed >= 0 &&
     (value.workerInstanceLimit === undefined ||
       (Number.isSafeInteger(value.workerInstanceLimit) && value.workerInstanceLimit >= 0)) &&
     Number.isSafeInteger(value.workerMemoryMB) &&
     value.workerMemoryMB > 0 &&
     serviceIDs.every((id) => uuidPattern.test(id)) &&
-    value.observedServiceIDs.every((id) => organizationServiceIDs.has(id.toLowerCase())) &&
     value.observedProvisioningServiceIDs.every((id) =>
       organizationServiceIDs.has(id.toLowerCase()),
     ) &&
-    new Set(value.observedServiceIDs.map((id) => id.toLowerCase())).size ===
-      value.observedServiceIDs.length &&
+    value.observedAppProvisioningServiceIDs.every((id) => appServiceIDs.has(id.toLowerCase())) &&
+    appServiceIDs.size === value.observedServiceIDs.length &&
+    new Set(value.observedAppProvisioningServiceIDs.map((id) => id.toLowerCase())).size ===
+      value.observedAppProvisioningServiceIDs.length &&
     organizationServiceIDs.size === value.observedOrganizationServiceIDs.length &&
     new Set(value.observedProvisioningServiceIDs.map((id) => id.toLowerCase())).size ===
-      value.observedProvisioningServiceIDs.length &&
-    new Set(value.memoryAccountedServiceIDs.map((id) => id.toLowerCase())).size ===
-      value.memoryAccountedServiceIDs.length &&
-    new Set(value.workerInstanceAccountedServiceIDs.map((id) => id.toLowerCase())).size ===
-      value.workerInstanceAccountedServiceIDs.length
+      value.observedProvisioningServiceIDs.length
   );
 }
 
@@ -2148,15 +2035,14 @@ function sameOrganizationCapacity(
     left.organizationServices === right.organizationServices &&
     left.serviceProvisioningConcurrency === right.serviceProvisioningConcurrency &&
     left.memoryMB === right.memoryMB &&
-    left.observedOrganizationServiceCount === right.observedOrganizationServiceCount &&
-    left.observedMemoryMB === right.observedMemoryMB &&
-    left.observedWorkerInstanceCount === right.observedWorkerInstanceCount &&
+    left.snapshotCapturedAt === right.snapshotCapturedAt &&
+    left.organizationServicesUsed === right.organizationServicesUsed &&
+    left.organizationMemoryMBUsed === right.organizationMemoryMBUsed &&
+    left.workerInstancesUsed === right.workerInstancesUsed &&
     left.workerInstanceLimit === right.workerInstanceLimit &&
     left.workerMemoryMB === right.workerMemoryMB &&
     sameStrings(left.observedOrganizationServiceIDs, right.observedOrganizationServiceIDs) &&
-    sameStrings(left.observedProvisioningServiceIDs, right.observedProvisioningServiceIDs) &&
-    sameStrings(left.memoryAccountedServiceIDs, right.memoryAccountedServiceIDs) &&
-    sameStrings(left.workerInstanceAccountedServiceIDs, right.workerInstanceAccountedServiceIDs)
+    sameStrings(left.observedProvisioningServiceIDs, right.observedProvisioningServiceIDs)
   );
 }
 
@@ -2916,6 +2802,11 @@ function quotaInteger(value: JSONRecord, field: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function usageInteger(value: JSONRecord, field: string): number | undefined {
+  const raw = value[field];
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
+}
+
 function quotaStrings(value: JSONRecord, field: string): string[] {
   const raw = value[field];
   if (raw === undefined) return [];
@@ -2949,90 +2840,53 @@ function quotaIntegerMap(value: JSONRecord, field: string): Record<string, numbe
   return parsed;
 }
 
-function deploymentCapacityShape(
-  service: KoyebService,
-  deployment: KoyebDeployment,
-): KoyebDeploymentCapacityShape {
-  if (service.type === "DATABASE") {
-    const database = asObject(deployment.definition["database"]);
-    const neonPostgres = asObject(database["neon_postgres"]);
-    if (
-      !validKoyebName(stringValue(neonPostgres["instance_type"])) ||
-      !stringValue(neonPostgres["region"])
-    ) {
-      throw capacityEvidenceError("database deployment capacity definition is malformed");
-    }
-    // Koyeb DATABASE deployments describe Neon capacity separately from compute
-    // instance_types/scalings. The organization API does not establish whether
-    // that capacity participates in memory_mb, so admitting against it would
-    // treat an unknown reservation as zero.
-    throw capacityEvidenceError("database memory quota participation is unresolved");
-  }
-  const regions = deployment.definition["regions"];
-  const instanceTypes = deployment.definition["instance_types"];
-  const scalings = deployment.definition["scalings"];
-  if (
-    !Array.isArray(regions) ||
-    regions.length === 0 ||
-    !Array.isArray(instanceTypes) ||
-    instanceTypes.length === 0 ||
-    !Array.isArray(scalings) ||
-    scalings.length === 0
-  ) {
-    throw capacityEvidenceError("deployment capacity definition is incomplete");
-  }
-  const deploymentRegions = regions.map((region) => stringValue(region));
-  if (
-    deploymentRegions.some((region) => !validKoyebName(region)) ||
-    new Set(deploymentRegions).size !== deploymentRegions.length
-  ) {
-    throw capacityEvidenceError("deployment regions are malformed");
-  }
-  const types = instanceTypes.map((entry) => stringValue(asObject(entry)["type"]));
-  if (
-    types.some((instanceType) => !validKoyebName(instanceType)) ||
-    new Set(types).size !== types.length
-  ) {
-    throw capacityEvidenceError("deployment instance types are malformed");
-  }
-  let maxReplicas = 0;
-  for (const entry of scalings) {
-    const scaling = asObject(entry);
-    const maximum = scaling["max"];
-    if (!Number.isSafeInteger(maximum) || Number(maximum) < 0) {
-      throw capacityEvidenceError("deployment scaling capacity is malformed");
-    }
-    const scopes = scaling["scopes"];
-    let regionCount = deploymentRegions.length;
-    if (!nullish(scopes) && (!Array.isArray(scopes) || scopes.length > 0)) {
-      if (!Array.isArray(scopes)) {
-        throw capacityEvidenceError("deployment scaling scopes are malformed");
-      }
-      const scopedRegions = scopes.map((scope) =>
-        typeof scope === "string" && scope.startsWith("region:") ? scope.slice(7) : "",
-      );
-      if (
-        scopedRegions.some((region) => !deploymentRegions.includes(region)) ||
-        new Set(scopedRegions).size !== scopedRegions.length
-      ) {
-        throw capacityEvidenceError("deployment scaling scopes are malformed");
-      }
-      regionCount = scopedRegions.length;
-    }
-    const scopedMaximum = Number(maximum) * regionCount;
-    if (!Number.isSafeInteger(scopedMaximum)) {
-      throw capacityEvidenceError("deployment scaling capacity overflowed");
-    }
-    maxReplicas += scopedMaximum;
-    if (!Number.isSafeInteger(maxReplicas)) {
-      throw capacityEvidenceError("deployment scaling capacity overflowed");
-    }
-  }
-  return { instanceTypes: types, maxReplicas };
-}
-
 function capacityEvidenceError(detail: string): ProviderResourceUnresolvedError {
   return new ProviderResourceUnresolvedError(`Koyeb ${detail}`);
+}
+
+function observedProvisioningServiceIDs(
+  services: readonly KoyebService[],
+  deployments: readonly KoyebDeployment[],
+): string[] {
+  const deploymentsByID = new Map(
+    deployments.map((deployment) => [deployment.id.toLowerCase(), deployment]),
+  );
+  const observed = new Set(
+    services
+      .filter((service) => provisioningServiceStatuses.has(service.status))
+      .map((service) => service.id.toLowerCase()),
+  );
+  for (const service of services) {
+    const deploymentIDs = [service.activeDeploymentID, service.latestDeploymentID].filter(
+      (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
+    );
+    if (deploymentIDs.length === 0 || deploymentIDs.some((id) => !uuidPattern.test(id))) {
+      throw capacityEvidenceError("service deployment identity is unresolved");
+    }
+    if (
+      service.activeDeploymentID &&
+      service.latestDeploymentID &&
+      service.activeDeploymentID !== service.latestDeploymentID
+    ) {
+      observed.add(service.id.toLowerCase());
+    }
+    for (const deploymentID of deploymentIDs) {
+      const deployment = deploymentsByID.get(deploymentID.toLowerCase());
+      if (
+        !deployment ||
+        deployment.id !== deploymentID ||
+        deployment.organizationID !== service.organizationID ||
+        deployment.appID !== service.appID ||
+        deployment.serviceID !== service.id
+      ) {
+        throw capacityEvidenceError("service deployment inventory is inconsistent");
+      }
+      if (provisioningDeploymentStatuses.has(deployment.status)) {
+        observed.add(service.id.toLowerCase());
+      }
+    }
+  }
+  return [...observed];
 }
 
 function memoryStringMB(value: string): number | undefined {
@@ -3063,18 +2917,6 @@ function koyebService(value: unknown): KoyebService {
   if (activeDeploymentID) parsed.activeDeploymentID = activeDeploymentID;
   if (latestDeploymentID) parsed.latestDeploymentID = latestDeploymentID;
   return parsed;
-}
-
-function koyebInstance(value: unknown): KoyebInstance {
-  const instance = asObject(value);
-  return {
-    id: stringValue(instance["id"]),
-    organizationID: stringValue(instance["organization_id"]),
-    appID: stringValue(instance["app_id"]),
-    serviceID: stringValue(instance["service_id"]),
-    type: stringValue(instance["type"]),
-    status: stringValue(instance["status"]),
-  };
 }
 
 function koyebDeployment(value: unknown): KoyebDeployment {

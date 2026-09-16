@@ -241,6 +241,7 @@ import {
   KoyebResumableProvisioning,
   koyebConfigurationMissing,
   koyebPrivateMeshAvailable,
+  koyebRegisteredAppIDs,
 } from "./koyeb";
 import {
   MarketplaceInputError,
@@ -1189,7 +1190,8 @@ export class FleetCoordinator {
     this.leaseProvisioning = new LeaseProvisioningController(
       state,
       env,
-      (provider) => this.provider(provider).resumableProvisioning?.(),
+      (provider, lease) =>
+        this.provider(provider, lease.region, lease.providerProject).resumableProvisioning?.(),
       async (transaction, lease, result) => {
         const now = new Date().toISOString();
         const completed: LeaseRecord = {
@@ -4938,25 +4940,65 @@ export class FleetCoordinator {
     );
     // Rendering, randomness, crypto and read-only provider discovery stay outside retried transactions.
     const prepared = await capability.prepare(config, record);
-    record.providerScope = prepared.plan.scope;
-    const operation: LeaseProvisioningOperation = {
-      schema: 1,
-      leaseID,
-      operationID,
-      generation,
-      scope: prepared.plan.scope,
-      owner,
-      org,
-      provider: config.provider,
-      createdAt: now.getTime(),
-      deadline: now.getTime() + 30 * 60_000,
-      revision: 0,
-      step: prepared.step,
-      ...(fixedCreate ? { fixedRequestFingerprint: await fixedRequestFingerprint(input) } : {}),
-    };
-    validateProvisioningRecord(prepared.plan);
-    const sealed = await sealProvisioningMaterial(this.env, operation, prepared.material);
-    validateProvisioningRecord(sealed);
+    const candidates = prepared.candidates ?? [
+      { ...prepared, lease: { providerScope: prepared.plan.scope } },
+    ];
+    if (!candidates.length) throw new Error("durable provisioning returned no candidates");
+    const fixedFingerprint = fixedCreate ? await fixedRequestFingerprint(input) : undefined;
+    const deadline = now.getTime() + 30 * 60_000;
+    const sealedCandidates = await Promise.all(
+      candidates.map(async (candidate) => {
+        const target = candidate.lease;
+        if (
+          !target ||
+          typeof target !== "object" ||
+          Array.isArray(target) ||
+          Object.keys(target).some(
+            (key) => !["providerScope", "providerProject", "region"].includes(key),
+          ) ||
+          typeof target.providerScope !== "string" ||
+          !target.providerScope ||
+          target.providerScope !== target.providerScope.trim() ||
+          [target.providerProject, target.region].some(
+            (value) =>
+              value !== undefined &&
+              (typeof value !== "string" || !value || value !== value.trim()),
+          )
+        ) {
+          throw new Error("durable provisioning candidate lease target is invalid");
+        }
+        if (target.providerScope !== candidate.plan.scope) {
+          throw new Error("durable provisioning candidate scope mismatch");
+        }
+        const candidateRecord: LeaseRecord = {
+          ...record,
+          providerScope: target.providerScope,
+          ...(target.providerProject === undefined
+            ? {}
+            : { providerProject: target.providerProject }),
+          ...(target.region === undefined ? {} : { region: target.region }),
+        };
+        const operation: LeaseProvisioningOperation = {
+          schema: 1,
+          leaseID,
+          operationID,
+          generation,
+          scope: candidate.plan.scope,
+          owner,
+          org,
+          provider: config.provider,
+          createdAt: now.getTime(),
+          deadline,
+          revision: 0,
+          step: candidate.step,
+          ...(fixedFingerprint ? { fixedRequestFingerprint: fixedFingerprint } : {}),
+        };
+        validateProvisioningRecord(candidate.plan);
+        const sealed = await sealProvisioningMaterial(this.env, operation, candidate.material);
+        validateProvisioningRecord(sealed);
+        return { candidate, record: candidateRecord, operation, sealed };
+      }),
+    );
     const admission = await this.state.provisioning!.commitAndWake(async (transaction) => {
       const currentAttempt = await transaction.get<CreateAttemptRecord>(createAttemptKey(leaseID));
       const existing = await transaction.get<LeaseRecord>(leaseKey(leaseID));
@@ -4983,7 +5025,19 @@ export class FleetCoordinator {
         return createAttemptIDConflictResponse();
       if (await transaction.get(workspaceLeaseReservationKey(leaseID)))
         return workspaceManagedLeaseResponse();
-      await capability.validateAdmission?.(transaction, prepared.plan, record);
+      const selectedIndex = capability.selectAdmission
+        ? await capability.selectAdmission(transaction, candidates, record)
+        : 0;
+      if (
+        !Number.isSafeInteger(selectedIndex) ||
+        selectedIndex < 0 ||
+        selectedIndex >= sealedCandidates.length
+      ) {
+        throw new Error("durable provisioning candidate selection is invalid");
+      }
+      const selected = sealedCandidates[selectedIndex]!;
+      const selectedRecord = selected.record;
+      await capability.validateAdmission?.(transaction, selected.candidate.plan, selectedRecord);
       const storedLeases = [
         ...(await transaction.list<LeaseRecord>({ prefix: "lease:" })).values(),
       ];
@@ -5022,9 +5076,9 @@ export class FleetCoordinator {
           { status: 409 },
         );
       }
-      const usage = createCostLimitUsage(record, now);
+      const usage = createCostLimitUsage(selectedRecord, now);
       for (const lease of merged.values()) addLeaseToCostLimitUsage(usage, lease, now);
-      const limit = enforceCostLimitUsage(usage, record, costLimits(this.env));
+      const limit = enforceCostLimitUsage(usage, selectedRecord, costLimits(this.env));
       if (limit) return json({ error: "cost_limit_exceeded", message: limit }, { status: 429 });
       await clearHostReservations(transaction, clearedHostReservations);
       if (currentAttempt && attempt)
@@ -5034,11 +5088,16 @@ export class FleetCoordinator {
           generation,
           updatedAt: now.toISOString(),
         });
-      await transaction.put(leaseKey(leaseID), record);
-      await transaction.put(provisioningPlanKey(operationID), prepared.plan);
-      await transaction.put(provisioningMaterialKey(operationID), sealed);
-      await putProvisioningOperation(transaction, operation);
-      return { lease: record, replay: false, clearedHostReservations, hostScope: scope };
+      await transaction.put(leaseKey(leaseID), selectedRecord);
+      await transaction.put(provisioningPlanKey(operationID), selected.candidate.plan);
+      await transaction.put(provisioningMaterialKey(operationID), selected.sealed);
+      await putProvisioningOperation(transaction, selected.operation);
+      return {
+        lease: selectedRecord,
+        replay: false,
+        clearedHostReservations,
+        hostScope: scope,
+      };
     });
     if (admission instanceof Response) return admission;
     if (admission.hostScope && admission.clearedHostReservations)
@@ -5059,7 +5118,7 @@ export class FleetCoordinator {
     }
     if (prefersAsyncProvisioning(request) && admission.lease.state === "provisioning")
       return acceptedProvisioningLease(admission.lease);
-    while (Date.now() < operation.deadline) {
+    while (Date.now() < deadline) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- legacy callers retain a synchronous facade over durable work.
       await this.leaseProvisioning.advance(leaseID);
       // oxlint-disable-next-line eslint/no-await-in-loop -- observe only the admitted canonical lease.
@@ -5075,7 +5134,7 @@ export class FleetCoordinator {
     return json(
       {
         error: "provisioning_deadline_exceeded",
-        lease: publicLeaseRecord((await this.getLease(leaseID)) ?? record),
+        lease: publicLeaseRecord((await this.getLease(leaseID)) ?? admission.lease),
       },
       { status: 504 },
     );
@@ -8068,7 +8127,11 @@ export class FleetCoordinator {
   private projectCheckpointStore(lease: LeaseRecord): ProjectCheckpointStore {
     if (this.env.CRABBOX_PROJECT_CHECKPOINTS_ENABLED !== "true")
       throw new ProjectCheckpointError("checkpoint_storage_unconfigured");
-    const provider = this.provider(managedLeaseProvider(lease)!);
+    const provider = this.provider(
+      managedLeaseProvider(lease)!,
+      lease.region,
+      lease.providerProject,
+    );
     const io = provider.projectCheckpointIO?.();
     if (!io) throw new ProjectCheckpointError("checkpoint_provider_unsupported");
     let allowedRoots: unknown;
@@ -8145,7 +8208,11 @@ export class FleetCoordinator {
         } else if (input["action"] === "record-loss" && input["kind"] === "ttl") {
           binding = await store.recordLoss(lease, Number(generation), "ttl");
         } else if (input["action"] === "record-loss" && input["kind"] === "crash") {
-          const provider = this.provider(managedLeaseProvider(lease)!);
+          const provider = this.provider(
+            managedLeaseProvider(lease)!,
+            lease.region,
+            lease.providerProject,
+          );
           if (!(await provider.projectCheckpointLeaseMissing?.(lease)))
             throw new ProjectCheckpointError("checkpoint_crash_unproven");
           binding = await store.recordLoss(lease, Number(generation), "crash");
@@ -13131,7 +13198,11 @@ export class FleetCoordinator {
     if (resolvedLease.state !== "active" || Date.parse(resolvedLease.expiresAt) <= Date.now()) {
       return json({ error: "lease_not_active" }, { status: 409 });
     }
-    const poolProvider = this.provider(managedLeaseProvider(resolvedLease)!);
+    const poolProvider = this.provider(
+      managedLeaseProvider(resolvedLease)!,
+      resolvedLease.region,
+      resolvedLease.providerProject,
+    );
     if (
       poolProvider.readyPoolSingleUse &&
       (!typed ||
@@ -13458,7 +13529,8 @@ export class FleetCoordinator {
     if (identityError) return identityError;
     if (!isCoordinatorProvider(input.identity.image.provider))
       return json({ error: "invalid_provider" }, { status: 400 });
-    const provider = this.provider(input.identity.image.provider);
+    const providerName = input.identity.image.provider;
+    const provider = this.provider(providerName);
     if (
       !provider.readyPoolSingleUse ||
       !provider.claimReadyPoolLease ||
@@ -13474,7 +13546,11 @@ export class FleetCoordinator {
         exclusive: (operation) => this.state.runExclusive(operation),
         principal: { owner: requestOwner(request), org: requestOrg(request, this.env) },
         matches: (lease) => this.readyPoolIdentityMatchesLease(input.identity, lease),
-        claim: (lease, token) => provider.claimReadyPoolLease!(lease, token),
+        claim: (lease, token) =>
+          this.provider(providerName, lease.region, lease.providerProject).claimReadyPoolLease!(
+            lease,
+            token,
+          ),
       });
       await this.state.runExclusive(() => this.scheduleAlarm());
       return json({
@@ -19293,7 +19369,7 @@ export class FleetCoordinator {
       return new DaytonaProvider(this.env);
     }
     if (provider === "koyeb") {
-      return new KoyebProvider(this.env);
+      return new KoyebProvider(this.env, fetch, project);
     }
     return new HetznerProvider(this.env);
   }
@@ -28465,25 +28541,44 @@ export class GCPProvider implements CloudProvider {
 }
 
 export class KoyebProvider implements CloudProvider {
-  private clientValue?: KoyebClient;
+  private readonly clients = new Map<string, KoyebClient>();
   readonly readyPoolSingleUse = true;
 
   constructor(
     private readonly env: Env,
     private readonly fetcher: typeof fetch = fetch,
+    private readonly targetAppID?: string,
   ) {}
 
   private get client(): KoyebClient {
-    this.clientValue ??= new KoyebClient(this.env, this.fetcher);
-    return this.clientValue;
+    return this.clientForApp(this.targetAppID);
+  }
+
+  private clientForApp(appID?: string): KoyebClient {
+    const key = appID ?? this.env.CRABBOX_KOYEB_APP_ID?.trim() ?? "";
+    let client = this.clients.get(key);
+    if (!client) {
+      client = new KoyebClient(this.env, this.fetcher, appID);
+      this.clients.set(key, client);
+    }
+    return client;
+  }
+
+  private clientForLease(lease: LeaseRecord): KoyebClient {
+    if (this.targetAppID && lease.providerProject && lease.providerProject !== this.targetAppID) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb lease target does not match the selected provider context",
+      );
+    }
+    return this.clientForApp(lease.providerProject ?? this.targetAppID);
   }
 
   resumableProvisioning(): ProviderResumableProvisioning {
-    return new KoyebResumableProvisioning(this.env, this.fetcher);
+    return new KoyebResumableProvisioning(this.env, this.fetcher, this.targetAppID);
   }
 
   readyPoolImageIdentity(lease: LeaseRecord): ReadyPoolImageIdentity | undefined {
-    return this.client.readyPoolImageIdentity(lease);
+    return this.clientForLease(lease).readyPoolImageIdentity(lease);
   }
 
   supportsReadyPoolImageIdentity(identity: ReadyPoolImageIdentity): boolean {
@@ -28491,22 +28586,22 @@ export class KoyebProvider implements CloudProvider {
   }
 
   observeReadyPoolImageIdentity(lease: LeaseRecord): Promise<LeaseImageIdentity | undefined> {
-    return this.client.observeReadyPoolImageIdentity(lease);
+    return this.clientForLease(lease).observeReadyPoolImageIdentity(lease);
   }
 
   prepareReadyPoolLease(lease: LeaseRecord): Promise<void> {
-    return this.client.prepareReadyPoolLease(lease);
+    return this.clientForLease(lease).prepareReadyPoolLease(lease);
   }
 
   claimReadyPoolLease(lease: LeaseRecord, claim: string): Promise<void> {
-    return this.client.claimReadyPoolLease(lease, claim);
+    return this.clientForLease(lease).claimReadyPoolLease(lease, claim);
   }
 
   projectCheckpointIO(): ProjectCheckpointIO {
     return {
       capture: async (lease, root, allowedRoot, dependencyPolicy) =>
         JSON.parse(
-          await this.client.runProjectState(lease, {
+          await this.clientForLease(lease).runProjectState(lease, {
             action: "capture",
             root,
             allowedRoot,
@@ -28515,7 +28610,7 @@ export class KoyebProvider implements CloudProvider {
         ) as unknown,
       restore: async (lease, root, allowedRoot, snapshot) =>
         JSON.parse(
-          await this.client.runProjectState(lease, {
+          await this.clientForLease(lease).runProjectState(lease, {
             action: "restore",
             root,
             allowedRoot,
@@ -28526,11 +28621,14 @@ export class KoyebProvider implements CloudProvider {
   }
 
   async projectCheckpointLeaseMissing(lease: LeaseRecord): Promise<boolean> {
-    return !(await this.client.ownedServiceForLease(lease));
+    return !(await this.clientForLease(lease).ownedServiceForLease(lease));
   }
 
-  listCrabboxServers(): Promise<ProviderMachine[]> {
-    return this.client.listCrabboxServers();
+  async listCrabboxServers(): Promise<ProviderMachine[]> {
+    const appIDs = this.targetAppID ? [this.targetAppID] : koyebRegisteredAppIDs(this.env);
+    return (
+      await Promise.all(appIDs.map((appID) => this.clientForApp(appID).listCrabboxServers()))
+    ).flat();
   }
 
   supportsSSHHostKeyInjection(): boolean {
@@ -28558,7 +28656,7 @@ export class KoyebProvider implements CloudProvider {
         "Koyeb cleanup requires durable evidence and current ownership",
       );
     }
-    return this.client.deleteOwnedService(lease, {
+    return this.clientForLease(lease).deleteOwnedService(lease, {
       assertCleanupOwner: context.assertCleanupOwner,
       saveCleanupEvidence: context.saveCleanupEvidence,
     });

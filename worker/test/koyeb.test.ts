@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { leaseConfig } from "../src/config";
 import { sha256Hex } from "../src/encoding";
 import { FleetCoordinator, KoyebProvider, readyPoolSeedDigestV1 } from "../src/fleet";
-import { KoyebClient, KoyebHTTPError, KoyebResumableProvisioning } from "../src/koyeb";
+import {
+  KoyebClient,
+  KoyebHTTPError,
+  KoyebResumableProvisioning,
+  koyebConfigurationMissing,
+  koyebRegisteredAppIDs,
+} from "../src/koyeb";
 import {
   provisioningOperationKey,
   type LeaseProvisioningOperation,
@@ -31,6 +37,10 @@ const deploymentID = "22222222-2222-4222-8222-222222222222";
 const latestDeploymentID = "33333333-3333-4333-8333-333333333333";
 const serviceName = leaseProviderName("cbx_abcdef123456", "blue-lobster");
 const appName = "my-app";
+const secondAppID = "66666666-6666-4666-8666-666666666666";
+const secondAppName = "my-app-workers-2";
+const thirdAppID = "99999999-9999-4999-8999-999999999999";
+const thirdAppName = "my-app-workers-3";
 const privateHost = `${serviceName}.${appName}.internal`;
 const runnerImage = `ghcr.io/example/crabbox-koyeb-runner:source-${"b".repeat(40)}@sha256:${"a".repeat(64)}`;
 const digestOnlyRunnerImage = `ghcr.io/example/crabbox-koyeb-runner@sha256:${"c".repeat(64)}`;
@@ -63,6 +73,27 @@ const fleetEnv: Env = {
   CRABBOX_TAILSCALE_CLIENT_ID: "synthetic-tailscale-client",
   CRABBOX_TAILSCALE_CLIENT_SECRET: "synthetic-tailscale-secret",
 };
+
+function managedAppPoolEnv(overrides: Partial<Env> = {}): Env {
+  return {
+    ...fleetEnv,
+    CRABBOX_KOYEB_APP_TARGETS: JSON.stringify([
+      {
+        organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+        appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+        appName,
+        region: "was",
+      },
+      {
+        organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+        appID: secondAppID,
+        appName: secondAppName,
+        region: "was",
+      },
+    ]),
+    ...overrides,
+  } as Env;
+}
 
 afterEach(() => {
   vi.useRealTimers();
@@ -151,6 +182,143 @@ function service(overrides: Record<string, unknown> = {}) {
     life_cycle: { delete_after_create: 3_600, delete_after_sleep: 600 },
     ...overrides,
   };
+}
+
+function capacityDeployment(
+  id: string,
+  targetServiceID: string,
+  targetAppID: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    id,
+    organization_id: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+    app_id: targetAppID,
+    service_id: targetServiceID,
+    status: "HEALTHY",
+    definition: {
+      regions: ["was"],
+      instance_types: [{ type: "large" }],
+      scalings: [{ min: 1, max: 1, targets: [] }],
+    },
+    metadata: {},
+    ...overrides,
+  };
+}
+
+function capacityInstance(
+  id: string,
+  targetServiceID: string,
+  targetAppID: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    id,
+    organization_id: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+    app_id: targetAppID,
+    service_id: targetServiceID,
+    type: "large",
+    status: "HEALTHY",
+    ...overrides,
+  };
+}
+
+function capacityFixture(
+  options: {
+    quotas?: Record<string, unknown>;
+    services?: Array<Record<string, unknown>>;
+    deployments?: Array<Record<string, unknown>>;
+    instances?: Array<Record<string, unknown>>;
+    appNames?: Record<string, string>;
+    catalogMemory?: Record<string, string>;
+  } = {},
+) {
+  const requests: Request[] = [];
+  const appNames = options.appNames ?? {
+    [baseEnv.CRABBOX_KOYEB_APP_ID!]: appName,
+    [secondAppID]: secondAppName,
+    [thirdAppID]: thirdAppName,
+  };
+  const fetcher = vi.fn<typeof fetch>(async (request) => {
+    const incoming = request instanceof Request ? request.clone() : new Request(request);
+    requests.push(incoming.clone());
+    const url = new URL(incoming.url);
+    if (url.pathname.startsWith("/v1/apps/")) {
+      const appID = url.pathname.split("/").at(-1)!;
+      return Response.json({
+        app: {
+          id: appID,
+          name: appNames[appID] ?? "drifted-app",
+          organization_id: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+        },
+      });
+    }
+    if (url.pathname.endsWith("/quotas")) {
+      return Response.json({
+        quotas: {
+          services_by_app: "16",
+          services: "1000",
+          service_provisioning_concurrency: "30",
+          memory_mb: "548576",
+          instance_types: [],
+          regions: [],
+          max_instances_by_type: {},
+          ...options.quotas,
+        },
+      });
+    }
+    if (url.pathname === "/v1/services") {
+      const services = options.services ?? [];
+      return Response.json({
+        services,
+        count: services.length,
+        offset: 0,
+        limit: 100,
+        has_next: false,
+      });
+    }
+    if (url.pathname === "/v1/deployments") {
+      const deployments = options.deployments ?? [];
+      return Response.json({
+        deployments,
+        count: deployments.length,
+        offset: 0,
+        limit: 100,
+        has_next: false,
+      });
+    }
+    if (url.pathname === "/v1/instances") {
+      const instances = options.instances ?? [];
+      return Response.json({
+        instances,
+        count: instances.length,
+        offset: 0,
+        limit: 100,
+        has_next: false,
+      });
+    }
+    if (url.pathname.startsWith("/v1/catalog/instances/")) {
+      const instanceType = url.pathname.split("/").at(-1)!;
+      return Response.json({
+        instance: {
+          id: instanceType,
+          memory: options.catalogMemory?.[instanceType] ?? "4GB",
+        },
+      });
+    }
+    throw new Error(`unexpected request ${incoming.method} ${incoming.url}`);
+  });
+  return { fetcher, requests };
+}
+
+async function managedCapacityCandidates(
+  options: Parameters<typeof capacityFixture>[0] = {},
+  env = managedAppPoolEnv(),
+) {
+  const fixture = capacityFixture(options);
+  const capability = new KoyebResumableProvisioning(env, fixture.fetcher);
+  const prepared = await capability.prepare(meshConfig(), lease());
+  return { ...fixture, capability, candidates: prepared.candidates! };
 }
 
 function inventoryServices(count: number, offset = 0) {
@@ -290,10 +458,11 @@ async function advanceFleetProvisioning(
   throw new Error("Koyeb provisioning did not publish an active lease");
 }
 
-async function activeCleanupFixture() {
+async function activeCleanupFixture(transport: "tailscale" | "koyeb-mesh" = "tailscale") {
   const active = lease({
     state: "active",
     cloudID: serviceID,
+    ...(transport === "koyeb-mesh" ? { host: privateHost } : {}),
     region: "was",
     providerScope: await new KoyebClient(baseEnv, vi.fn<typeof fetch>()).providerScope(),
     image: {
@@ -324,7 +493,8 @@ async function activeCleanupFixture() {
       return state.deletes ? state.observe() : Response.json({ service: service() });
     }
     if (path === `/v1/deployments/${deploymentID}`) {
-      const owned = deployment("u".repeat(32));
+      const owned =
+        transport === "koyeb-mesh" ? meshDeployment("u".repeat(32)) : deployment("u".repeat(32));
       owned.definition.env = owned.definition.env.map((entry) =>
         entry.key === "CRABBOX_LEASE_ORG"
           ? { ...entry, value: providerLabelValue(active.org) }
@@ -934,16 +1104,1034 @@ describe("Koyeb service inventory", () => {
   });
 });
 
+describe("Koyeb managed app targets", () => {
+  it.each([
+    ["malformed JSON", "{"],
+    [
+      "duplicate app IDs",
+      JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName: secondAppName,
+          region: "was",
+        },
+      ]),
+    ],
+    [
+      "duplicate app names",
+      JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: secondAppID,
+          appName,
+          region: "was",
+        },
+      ]),
+    ],
+    [
+      "missing legacy target",
+      JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: secondAppID,
+          appName: secondAppName,
+          region: "was",
+        },
+      ]),
+    ],
+    [
+      "wrong organization",
+      JSON.stringify([
+        {
+          organizationID: "77777777-7777-4777-8777-777777777777",
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+      ]),
+    ],
+    [
+      "wrong region",
+      JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "fra",
+        },
+      ]),
+    ],
+  ])("rejects %s", (_name, targets) => {
+    expect(
+      koyebConfigurationMissing({ ...baseEnv, CRABBOX_KOYEB_APP_TARGETS: targets } as Env),
+    ).toContain("CRABBOX_KOYEB_APP_TARGETS");
+  });
+
+  it("counts every service type and exposes thirty worker slots across two apps", async () => {
+    const env = managedAppPoolEnv();
+    const firstServiceID = "77777777-7777-4777-8777-777777777777";
+    const secondServiceID = "88888888-8888-4888-8888-888888888888";
+    const firstDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const secondDeploymentID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const baselineServices = [
+      service({
+        id: firstServiceID,
+        name: "coordinator",
+        type: "WEB",
+        active_deployment_id: firstDeploymentID,
+        latest_deployment_id: firstDeploymentID,
+      }),
+      service({
+        id: secondServiceID,
+        name: "background-worker",
+        type: "WORKER",
+        active_deployment_id: secondDeploymentID,
+        latest_deployment_id: secondDeploymentID,
+      }),
+    ];
+    const { fetcher, requests } = capacityFixture({
+      services: baselineServices,
+      deployments: [
+        capacityDeployment(firstDeploymentID, firstServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        capacityDeployment(secondDeploymentID, secondServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+      ],
+    });
+    const capability = new KoyebResumableProvisioning(env, fetcher);
+    const prepared = await capability.prepare(meshConfig(), lease());
+    const candidates = prepared.candidates!;
+
+    expect(candidates).toHaveLength(2);
+    expect(
+      requests
+        .map((request) => new URL(request.url))
+        .filter((request) => request.pathname === "/v1/services")
+        .every(
+          (request) => !request.searchParams.has("types") && !request.searchParams.has("app_id"),
+        ),
+    ).toBe(true);
+    expect(
+      candidates.map((candidate) => ({
+        appID: candidate.lease.providerProject,
+        region: candidate.lease.region,
+        observed: (candidate.plan.data as any).capacity.observedServiceIDs.length,
+        readyPoolScope: (candidate.plan.data as any).readyPoolScope,
+        privateHost: (candidate.plan.data as any).privateHost,
+      })),
+    ).toEqual([
+      {
+        appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+        region: "was",
+        observed: 2,
+        readyPoolScope: readyScope,
+        privateHost,
+      },
+      {
+        appID: secondAppID,
+        region: "was",
+        observed: 0,
+        readyPoolScope: readyScope,
+        privateHost: `${serviceName}.${secondAppName}.internal`,
+      },
+    ]);
+
+    const storage = new ProvisioningTestStorage();
+    const selectedApps: string[] = [];
+    for (let index = 0; index < 30; index += 1) {
+      const reservation = lease({ id: `cbx_${index.toString(16).padStart(12, "0")}` });
+      const selected = await capability.selectAdmission(storage, candidates, reservation);
+      const candidate = candidates[selected]!;
+      Object.assign(reservation, candidate.lease);
+      await storage.put(`lease:${reservation.id}`, reservation);
+      selectedApps.push(reservation.providerProject!);
+    }
+    expect(selectedApps.filter((appID) => appID === baseEnv.CRABBOX_KOYEB_APP_ID)).toHaveLength(14);
+    expect(selectedApps.filter((appID) => appID === secondAppID)).toHaveLength(16);
+    await expect(
+      capability.selectAdmission(storage, candidates, lease({ id: "cbx_ffffffffffff" })),
+    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+    expect(
+      requests.filter((request) => new URL(request.url).pathname === "/v1/services"),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing services_by_app", { services_by_app: undefined }],
+    ["malformed service concurrency", { service_provisioning_concurrency: "30oops" }],
+    ["zero memory", { memory_mb: "0" }],
+    ["malformed instance type restrictions", { instance_types: "large" }],
+    ["malformed region restrictions", { regions: ["US East"] }],
+    ["malformed per-type limits", { max_instances_by_type: { large: "many" } }],
+  ])("fails closed on %s quota evidence", async (_label, quotas) => {
+    await expect(
+      managedCapacityCandidates({ quotas: quotas as Record<string, unknown> }),
+    ).rejects.toThrow(/Koyeb organization .*quota|Koyeb organization quota evidence/);
+  });
+
+  it.each([
+    ["excluded instance type", { instance_types: ["medium"] }],
+    ["excluded region", { regions: ["fra"] }],
+  ])("rejects a configured %s", async (_label, quotas) => {
+    await expect(
+      managedCapacityCandidates({ quotas: quotas as Record<string, unknown> }),
+    ).rejects.toThrow("excluded by organization quota");
+  });
+
+  it("fails closed on incomplete service, deployment, instance, and catalog usage evidence", async () => {
+    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const cases: Array<{
+      options: Parameters<typeof capacityFixture>[0];
+      message: string;
+    }> = [
+      {
+        options: {
+          services: [
+            service({
+              id: capacityServiceID,
+              active_deployment_id: "",
+              latest_deployment_id: "",
+            }),
+          ],
+        },
+        message: "service deployment identity is unresolved",
+      },
+      {
+        options: {
+          services: [
+            service({
+              id: capacityServiceID,
+              active_deployment_id: capacityDeploymentID,
+              latest_deployment_id: capacityDeploymentID,
+            }),
+          ],
+        },
+        message: "service deployment inventory is inconsistent",
+      },
+      {
+        options: {
+          services: [
+            service({
+              id: capacityServiceID,
+              active_deployment_id: capacityDeploymentID,
+              latest_deployment_id: capacityDeploymentID,
+            }),
+          ],
+          deployments: [
+            capacityDeployment(
+              capacityDeploymentID,
+              capacityServiceID,
+              baseEnv.CRABBOX_KOYEB_APP_ID!,
+              { definition: { regions: ["was"], instance_types: [{ type: "large" }] } },
+            ),
+          ],
+        },
+        message: "deployment capacity definition is incomplete",
+      },
+      {
+        options: {
+          instances: [
+            capacityInstance(
+              "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+              capacityServiceID,
+              baseEnv.CRABBOX_KOYEB_APP_ID!,
+              { status: "UNKNOWN" },
+            ),
+          ],
+        },
+        message: "instance inventory is malformed",
+      },
+      {
+        options: { catalogMemory: { large: "unknown" } },
+        message: "instance catalog memory is malformed",
+      },
+    ];
+
+    for (const testCase of cases) {
+      await expect(managedCapacityCandidates(testCase.options)).rejects.toThrow(testCase.message);
+    }
+  });
+
+  it("fails closed for a production-shaped DATABASE deployment with unresolved memory quota participation", async () => {
+    const databaseServiceID = "77777777-7777-4777-8777-777777777777";
+    const databaseDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    await expect(
+      managedCapacityCandidates({
+        services: [
+          service({
+            id: databaseServiceID,
+            name: "postgres",
+            type: "DATABASE",
+            active_deployment_id: databaseDeploymentID,
+            latest_deployment_id: databaseDeploymentID,
+          }),
+        ],
+        deployments: [
+          capacityDeployment(
+            databaseDeploymentID,
+            databaseServiceID,
+            baseEnv.CRABBOX_KOYEB_APP_ID!,
+            {
+              definition: {
+                type: "DATABASE",
+                database: {
+                  neon_postgres: {
+                    pg_version: 16,
+                    region: "aws-eu-central-1",
+                    instance_type: "free",
+                    roles: [],
+                    databases: [],
+                  },
+                },
+              },
+            },
+          ),
+        ],
+      }),
+    ).rejects.toThrow("Koyeb database memory quota participation is unresolved");
+  });
+
+  it.each([
+    ["global scaling across both deployment regions", [{ min: 1, max: 1, targets: [] }]],
+    [
+      "region-scoped scaling across both deployment regions",
+      [
+        { scopes: ["region:was"], min: 1, max: 1, targets: [] },
+        { scopes: ["region:fra"], min: 1, max: 1, targets: [] },
+      ],
+    ],
+  ])("reserves memory for %s", async (_label, scalings) => {
+    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: { memory_mb: "8192" },
+      services: [
+        service({
+          id: capacityServiceID,
+          active_deployment_id: capacityDeploymentID,
+          latest_deployment_id: capacityDeploymentID,
+        }),
+      ],
+      deployments: [
+        capacityDeployment(capacityDeploymentID, capacityServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!, {
+          definition: {
+            regions: ["was", "fra"],
+            instance_types: [{ type: "large" }],
+            scalings,
+          },
+        }),
+      ],
+    });
+
+    await expect(
+      capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
+    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+  });
+
+  it("fails closed when a deployment has no scaling capacity evidence", async () => {
+    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    await expect(
+      managedCapacityCandidates({
+        services: [
+          service({
+            id: capacityServiceID,
+            active_deployment_id: capacityDeploymentID,
+            latest_deployment_id: capacityDeploymentID,
+          }),
+        ],
+        deployments: [
+          capacityDeployment(
+            capacityDeploymentID,
+            capacityServiceID,
+            baseEnv.CRABBOX_KOYEB_APP_ID!,
+            { definition: { regions: ["was"], instance_types: [{ type: "large" }], scalings: [] } },
+          ),
+        ],
+      }),
+    ).rejects.toThrow("Koyeb deployment capacity definition is incomplete");
+  });
+
+  it.each([
+    ["organization services", { services: "1" }],
+    ["provisioning concurrency", { service_provisioning_concurrency: "1" }],
+    ["memory", { memory_mb: "4096" }],
+    ["instance type", { max_instances_by_type: { large: "1" } }],
+  ])("blocks admission when %s capacity is exhausted", async (constraint, quotas) => {
+    const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+    const capacityDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const provisioning = constraint === "provisioning concurrency";
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: quotas as Record<string, unknown>,
+      services: [
+        service({
+          id: capacityServiceID,
+          status: provisioning ? "STARTING" : "HEALTHY",
+          active_deployment_id: capacityDeploymentID,
+          latest_deployment_id: capacityDeploymentID,
+        }),
+      ],
+      deployments: [
+        capacityDeployment(capacityDeploymentID, capacityServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!, {
+          status: provisioning ? "STARTING" : "HEALTHY",
+        }),
+      ],
+    });
+
+    await expect(
+      capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
+    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+  });
+
+  it.each([
+    [
+      "scaled service without an instance",
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      [
+        capacityDeployment(
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "77777777-7777-4777-8777-777777777777",
+          baseEnv.CRABBOX_KOYEB_APP_ID!,
+          {
+            definition: {
+              regions: ["was"],
+              instance_types: [{ type: "large" }],
+              scalings: [{ max: 2 }],
+            },
+          },
+        ),
+      ],
+    ],
+    [
+      "active and pending replacement deployments",
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      [
+        capacityDeployment(
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "77777777-7777-4777-8777-777777777777",
+          baseEnv.CRABBOX_KOYEB_APP_ID!,
+        ),
+        capacityDeployment(
+          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "77777777-7777-4777-8777-777777777777",
+          baseEnv.CRABBOX_KOYEB_APP_ID!,
+          { status: "PROVISIONING" },
+        ),
+      ],
+    ],
+  ])(
+    "reserves memory for %s",
+    async (_label, activeDeploymentID, replacementDeploymentID, deployments) => {
+      const capacityServiceID = "77777777-7777-4777-8777-777777777777";
+      const { capability, candidates } = await managedCapacityCandidates({
+        quotas: { memory_mb: "8192" },
+        services: [
+          service({
+            id: capacityServiceID,
+            active_deployment_id: activeDeploymentID,
+            latest_deployment_id: replacementDeploymentID,
+          }),
+        ],
+        deployments: deployments as Array<Record<string, unknown>>,
+      });
+
+      await expect(
+        capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
+      ).rejects.toThrow("Koyeb organization capacity is exhausted");
+    },
+  );
+
+  it("keeps an unterminated ERROR instance in memory and type capacity", async () => {
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: { memory_mb: "4096", max_instances_by_type: { large: "1" } },
+      instances: [
+        capacityInstance(
+          "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          "77777777-7777-4777-8777-777777777777",
+          baseEnv.CRABBOX_KOYEB_APP_ID!,
+          { status: "ERROR" },
+        ),
+      ],
+    });
+
+    await expect(
+      capability.selectAdmission(new ProvisioningTestStorage(), candidates, lease()),
+    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+  });
+
+  it("serializes simultaneous admissions against durable unobserved reservations", async () => {
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: {
+        services_by_app: "1",
+        services: "1",
+        service_provisioning_concurrency: "2",
+        memory_mb: "8192",
+      },
+    });
+    const storage = new ProvisioningTestStorage();
+    const admit = (id: string) =>
+      storage.transaction(async (transaction) => {
+        const reservation = lease({ id });
+        const selected = await capability.selectAdmission(transaction, candidates, reservation);
+        Object.assign(reservation, candidates[selected]!.lease);
+        await transaction.put(`lease:${id}`, reservation);
+        return reservation.providerProject;
+      });
+
+    const results = await Promise.allSettled([
+      admit("cbx_000000000001"),
+      admit("cbx_000000000002"),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((await storage.list({ prefix: "lease:" })).size).toBe(1);
+  });
+
+  it("counts a Fleet-shaped admitted lease before provider dispatch begins", async () => {
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: {
+        services_by_app: "1",
+        services: "1",
+        service_provisioning_concurrency: "1",
+        memory_mb: "4096",
+        max_instances_by_type: { large: "1" },
+      },
+    });
+    const storage = new ProvisioningTestStorage();
+    await storage.put(
+      "lease:cbx_admitted000001",
+      lease({
+        id: "cbx_admitted000001",
+        state: "provisioning",
+        cloudID: "",
+        provisioningResourceMayExist: false,
+        providerProject: candidates[0]!.lease.providerProject,
+        providerScope: candidates[0]!.lease.providerScope,
+        region: candidates[0]!.lease.region,
+      }),
+    );
+
+    await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+      "Koyeb organization capacity is exhausted",
+    );
+  });
+
+  it("rejects a durable lease whose observed service belongs to another registered app", async () => {
+    const targetServiceID = "77777777-7777-4777-8777-777777777777";
+    const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const { capability, candidates } = await managedCapacityCandidates({
+      services: [
+        service({
+          id: targetServiceID,
+          app_id: secondAppID,
+          active_deployment_id: targetDeploymentID,
+          latest_deployment_id: targetDeploymentID,
+        }),
+      ],
+      deployments: [capacityDeployment(targetDeploymentID, targetServiceID, secondAppID)],
+    });
+    const storage = new ProvisioningTestStorage();
+    await storage.put(
+      "lease:cbx_wrongapp00001",
+      lease({
+        id: "cbx_wrongapp00001",
+        state: "active",
+        cloudID: targetServiceID,
+        providerProject: candidates[0]!.lease.providerProject,
+        providerScope: candidates[0]!.lease.providerScope,
+        region: candidates[0]!.lease.region,
+      }),
+    );
+
+    await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+      "Koyeb durable lease service identity does not match its target app",
+    );
+  });
+
+  it("keeps ready-pool image compatibility stable while lease ownership stays app-specific", async () => {
+    const env = managedAppPoolEnv();
+    const secondScope = await new KoyebClient(
+      env,
+      vi.fn<typeof fetch>(),
+      secondAppID,
+    ).providerScope();
+    const selected = lease({
+      state: "active",
+      cloudID: serviceID,
+      providerProject: secondAppID,
+      providerScope: secondScope,
+      region: "was",
+      image: {
+        id: runnerImage,
+        source: "explicit",
+        provider: "koyeb",
+        kind: "koyeb-sandbox-runner",
+        region: "was",
+        scope: readyScope,
+        sourceID: registrySecret,
+      },
+    });
+    const target = new KoyebClient(env, vi.fn<typeof fetch>(), secondAppID);
+    const legacy = new KoyebClient(env, vi.fn<typeof fetch>());
+
+    expect(target.readyPoolImageIdentity(selected)).toEqual({
+      provider: "koyeb",
+      scope: readyScope,
+      id: runnerImage,
+    });
+    expect(target.supportsReadyPoolImageIdentity(target.readyPoolImageIdentity(selected)!)).toBe(
+      true,
+    );
+    await expect(legacy.ownedServiceForLease(selected)).rejects.toThrow(
+      "belongs to another context",
+    );
+  });
+
+  it("routes a selected second-app lease through provisioning, observation, checkpoint, ready-pool, and cleanup", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+    const env = managedAppPoolEnv();
+    const targetServiceID = "77777777-7777-4777-8777-777777777777";
+    const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const targetHost = `${serviceName}.${secondAppName}.internal`;
+    let created = false;
+    let deleted = false;
+    let sandboxSecret = "";
+    let projectAction = "";
+    let createdBody: Record<string, unknown> | undefined;
+    const routedRequests: Request[] = [];
+    const capacity = capacityFixture();
+    const targetService = () =>
+      service({
+        id: targetServiceID,
+        app_id: secondAppID,
+        status: deleted ? "DELETING" : "HEALTHY",
+        active_deployment_id: targetDeploymentID,
+        latest_deployment_id: targetDeploymentID,
+      });
+    const targetDeployment = () =>
+      meshDeployment(sandboxSecret, {
+        id: targetDeploymentID,
+        app_id: secondAppID,
+        service_id: targetServiceID,
+      });
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const incoming = input instanceof Request ? input.clone() : new Request(input);
+      routedRequests.push(incoming.clone());
+      const url = new URL(incoming.url);
+      if (url.hostname === targetHost) {
+        if (url.pathname.endsWith("/write_file")) {
+          const body = (await incoming.json()) as { content?: string };
+          try {
+            projectAction = String(
+              (JSON.parse(body.content ?? "") as Record<string, unknown>)["action"] ?? "",
+            );
+          } catch {
+            projectAction = "";
+          }
+          return Response.json({ ok: true });
+        }
+        if (url.pathname.endsWith("/health")) return Response.json({ ok: true });
+        if (url.pathname.endsWith("/bind_port")) {
+          return Response.json({ success: true, port: "22" });
+        }
+        if (url.pathname.endsWith("/run")) {
+          const body = (await incoming.json()) as { cmd?: string };
+          if (body.cmd === "/usr/local/bin/crabbox-koyeb-bootstrap") {
+            return Response.json({
+              stdout: JSON.stringify({
+                schema: "crabbox-koyeb-sandbox-runner/v2",
+                leaseId: serviceName,
+                ssh: { user: "crabbox", host: targetHost, port: 22, hostKey: sshHostKey },
+                network: { transport: "koyeb-mesh", privateHost: targetHost },
+              }),
+              stderr: "",
+              code: 0,
+            });
+          }
+          return Response.json({
+            stdout: JSON.stringify(
+              projectAction === "capture"
+                ? await projectSnapshot()
+                : { schema: "crabbox-clean-runner/v1", state: "clean" },
+            ),
+            stderr: "",
+            code: 0,
+          });
+        }
+      }
+      if (url.pathname === "/v1/services" && incoming.method === "POST") {
+        createdBody = (await incoming.json()) as Record<string, unknown>;
+        sandboxSecret = String(
+          (
+            (createdBody["definition"] as Record<string, unknown>)["env"] as Array<
+              Record<string, unknown>
+            >
+          ).find((entry) => entry["key"] === "SANDBOX_SECRET")?.["value"] ?? "",
+        );
+        created = true;
+        return Response.json({ service: targetService() });
+      }
+      if (
+        url.pathname === "/v1/services" &&
+        url.searchParams.get("app_id") === secondAppID &&
+        url.searchParams.has("name")
+      ) {
+        return Response.json({ services: created ? [targetService()] : [], has_next: false });
+      }
+      if (url.pathname === `/v1/services/${targetServiceID}` && incoming.method === "DELETE") {
+        deleted = true;
+        return Response.json({ service: targetService() });
+      }
+      if (url.pathname === `/v1/services/${targetServiceID}`) {
+        return Response.json({ service: targetService() });
+      }
+      if (url.pathname === `/v1/deployments/${targetDeploymentID}`) {
+        return Response.json({ deployment: targetDeployment() });
+      }
+      return capacity.fetcher(incoming);
+    });
+    const capability = new KoyebResumableProvisioning(env, fetcher);
+    const prepared = await capability.prepare(meshConfig(), lease());
+    const candidates = prepared.candidates!;
+    const storage = new ProvisioningTestStorage();
+    await storage.put(
+      "lease:cbx_existing000001",
+      lease({
+        id: "cbx_existing000001",
+        providerProject: candidates[0]!.lease.providerProject,
+        providerScope: candidates[0]!.lease.providerScope,
+        region: candidates[0]!.lease.region,
+      }),
+    );
+    const selected = await capability.selectAdmission(storage, candidates, lease());
+    expect(candidates[selected]!.lease.providerProject).toBe(secondAppID);
+    const candidate = candidates[selected]!;
+    const selectedLease = lease({ ...candidate.lease });
+    let step = candidate.step;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      step = await capability.advance({
+        plan: candidate.plan,
+        step,
+        lease: selectedLease,
+        deadline: Date.now() + 60_000,
+        recovering: false,
+        canceled: false,
+        material: candidate.material,
+      });
+    }
+    expect(step).toMatchObject({
+      phase: "ready-to-publish",
+      publication: {
+        server: { cloudID: targetServiceID, region: "was" },
+        access: { sshPort: "3031", workRoot: "/workspace/crabbox" },
+      },
+    });
+    expect(createdBody).toMatchObject({ app_id: secondAppID });
+
+    const active = lease({
+      ...candidate.lease,
+      state: "active",
+      cloudID: targetServiceID,
+      host: targetHost,
+      sshPort: "3031",
+      workRoot: "/workspace/crabbox",
+      image: step.publication!.image,
+    });
+    const provider = new KoyebProvider(env, fetcher);
+    expect(provider.readyPoolImageIdentity(active)).toEqual({
+      provider: "koyeb",
+      scope: readyScope,
+      id: runnerImage,
+    });
+    await expect(provider.observeReadyPoolImageIdentity(active)).resolves.toEqual(active.image);
+    await expect(
+      provider.projectCheckpointIO().capture(active, "/workspace/project-a", "/workspace", "none"),
+    ).resolves.toMatchObject({ schema: "crabbox-project-files/v1" });
+    await expect(provider.prepareReadyPoolLease(active)).resolves.toBeUndefined();
+    const cleanupEvidence: ProviderCleanupEvidence[] = [];
+    await expect(
+      provider.releaseLease(active, {
+        assertCleanupOwner: async () => {},
+        saveCleanupEvidence: async (evidence) => {
+          active.providerCleanup = structuredClone(evidence);
+          cleanupEvidence.push(structuredClone(evidence));
+        },
+      }),
+    ).resolves.toMatchObject({ status: "pending" });
+    expect(cleanupEvidence.at(-1)).toMatchObject({ provider: "koyeb", serviceID: targetServiceID });
+    expect(
+      routedRequests.some(
+        (request) =>
+          request.method === "DELETE" &&
+          new URL(request.url).pathname === `/v1/services/${targetServiceID}`,
+      ),
+    ).toBe(true);
+    expect(
+      routedRequests
+        .filter((request) => new URL(request.url).pathname.startsWith("/koyeb-sandbox/"))
+        .every((request) => new URL(request.url).hostname === targetHost),
+    ).toBe(true);
+  });
+
+  it("keeps a frozen target stable across registry reordering and additive reload", async () => {
+    const original = managedAppPoolEnv();
+    const fixture = capacityFixture();
+    const prepared = await new KoyebResumableProvisioning(original, fixture.fetcher).prepare(
+      meshConfig(),
+      lease(),
+    );
+    const frozen = prepared.candidates![1]!;
+    const originalScope = frozen.lease.providerScope;
+    const expanded = managedAppPoolEnv({
+      CRABBOX_KOYEB_APP_TARGETS: JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: thirdAppID,
+          appName: thirdAppName,
+          region: "was",
+        },
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: secondAppID,
+          appName: secondAppName,
+          region: "was",
+        },
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+      ]),
+    });
+    expect(koyebRegisteredAppIDs(expanded)).toEqual([
+      thirdAppID,
+      secondAppID,
+      baseEnv.CRABBOX_KOYEB_APP_ID,
+    ]);
+    const reloaded = new KoyebResumableProvisioning(expanded, fixture.fetcher);
+    await expect(
+      reloaded.advance({
+        plan: frozen.plan,
+        step: frozen.step,
+        lease: lease({ ...frozen.lease }),
+        deadline: Date.now() + 60_000,
+        recovering: false,
+        canceled: true,
+      }),
+    ).resolves.toMatchObject({ phase: "terminal" });
+    const reloadedClient = new KoyebClient(expanded, fixture.fetcher, secondAppID);
+    await expect(reloadedClient.providerScope()).resolves.toBe(originalScope);
+    expect(reloadedClient.region).toBe("was");
+    expect(reloadedClient.privateHost(serviceName)).toBe(
+      `${serviceName}.${secondAppName}.internal`,
+    );
+  });
+
+  it("rejects a frozen lease when its registered target is removed or renamed", async () => {
+    const fixture = capacityFixture();
+    const prepared = await new KoyebResumableProvisioning(
+      managedAppPoolEnv(),
+      fixture.fetcher,
+    ).prepare(meshConfig(), lease());
+    const frozen = prepared.candidates![1]!;
+    const input = {
+      plan: frozen.plan,
+      step: frozen.step,
+      lease: lease({ ...frozen.lease }),
+      deadline: Date.now() + 60_000,
+      recovering: false,
+      canceled: true as const,
+    };
+    const removed = managedAppPoolEnv({
+      CRABBOX_KOYEB_APP_TARGETS: JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+      ]),
+    });
+    await expect(
+      new KoyebResumableProvisioning(removed, fixture.fetcher).advance(input),
+    ).rejects.toThrow("Koyeb provisioning target registration is missing");
+
+    const renamed = managedAppPoolEnv({
+      CRABBOX_KOYEB_APP_TARGETS: JSON.stringify([
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: baseEnv.CRABBOX_KOYEB_APP_ID,
+          appName,
+          region: "was",
+        },
+        {
+          organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+          appID: secondAppID,
+          appName: "renamed-workers",
+          region: "was",
+        },
+      ]),
+    });
+    await expect(
+      new KoyebResumableProvisioning(renamed, fixture.fetcher).advance(input),
+    ).rejects.toThrow("Koyeb provisioning plan is invalid or belongs to another context");
+  });
+
+  it("rejects a registered target whose live app identity drifted", async () => {
+    await expect(
+      managedCapacityCandidates({
+        appNames: {
+          [baseEnv.CRABBOX_KOYEB_APP_ID!]: appName,
+          [secondAppID]: "renamed-workers",
+        },
+      }),
+    ).rejects.toThrow("Koyeb app target identity does not match its registration");
+  });
+
+  it("rejects a lease routed through a different explicit provider target", async () => {
+    const env = managedAppPoolEnv();
+    const secondScope = await new KoyebClient(
+      env,
+      vi.fn<typeof fetch>(),
+      secondAppID,
+    ).providerScope();
+    const selected = lease({
+      providerProject: secondAppID,
+      providerScope: secondScope,
+      region: "was",
+    });
+    const provider = new KoyebProvider(env, vi.fn<typeof fetch>(), baseEnv.CRABBOX_KOYEB_APP_ID);
+
+    expect(() =>
+      provider.releaseLease(selected, {
+        assertCleanupOwner: async () => {},
+        saveCleanupEvidence: async () => {},
+      }),
+    ).toThrow("Koyeb lease target does not match the selected provider context");
+  });
+
+  it("releases canonical capacity after native mesh cleanup clears access", async () => {
+    const cleanup = await activeCleanupFixture("koyeb-mesh");
+    cleanup.state.observe = () => new Response("not found", { status: 404 });
+    await expect(cleanup.advance()).resolves.toBeUndefined();
+    expect(cleanup.active.providerCleanup).toMatchObject({
+      provider: "koyeb",
+      confirmation: { method: "service-absent" },
+    });
+    const canonical = lease({
+      ...cleanup.active,
+      state: "released",
+      cleanupCompletedAt: new Date().toISOString(),
+      provisioningResourceMayExist: false,
+      host: "",
+    });
+    const storage = new ProvisioningTestStorage();
+    await storage.put(`lease:${canonical.id}`, canonical);
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: {
+        services_by_app: "1",
+        services: "1",
+        service_provisioning_concurrency: "1",
+        memory_mb: "4096",
+        max_instances_by_type: { large: "1" },
+      },
+    });
+    await expect(capability.selectAdmission(storage, candidates, lease())).resolves.toBe(0);
+  });
+
+  it("preserves legacy cleanup proof after registry expansion and releases only canonical capacity", async () => {
+    const cleanup = await activeCleanupFixture();
+    cleanup.state.observe = () => new Response("not found", { status: 404 });
+    await expect(cleanup.advance()).resolves.toBeUndefined();
+    const completedAt = "2026-09-08T12:06:00.000Z";
+    const canonical = lease({
+      ...cleanup.active,
+      state: "released",
+      cleanupCompletedAt: completedAt,
+      provisioningResourceMayExist: false,
+      host: "",
+    });
+    const noResource = lease({
+      id: "cbx_noresource001",
+      state: "failed",
+      cloudID: "",
+      providerProject: baseEnv.CRABBOX_KOYEB_APP_ID,
+      providerScope: await new KoyebClient(
+        managedAppPoolEnv(),
+        vi.fn<typeof fetch>(),
+      ).providerScope(),
+      region: "was",
+      provisioningResourceMayExist: false,
+    });
+    const storage = new ProvisioningTestStorage();
+    await storage.put(`lease:${canonical.id}`, canonical);
+    await storage.put(`lease:${noResource.id}`, noResource);
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: {
+        services_by_app: "1",
+        services: "1",
+        service_provisioning_concurrency: "1",
+        memory_mb: "4096",
+        max_instances_by_type: { large: "1" },
+      },
+    });
+    await expect(capability.selectAdmission(storage, candidates, lease())).resolves.toBe(0);
+
+    const stale = lease({
+      ...noResource,
+      id: "cbx_staleevidence1",
+      provisioningRequestStartedAt: "2026-09-08T12:05:00.000Z",
+    });
+    await storage.put(`lease:${stale.id}`, stale);
+    await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+      "Koyeb organization capacity is exhausted",
+    );
+  });
+});
+
 describe("Koyeb Sandbox coordinator adapter", () => {
-  it("rejects private mesh when the coordinator is not in the configured Koyeb app", async () => {
+  it.each([
+    ["app", { KOYEB_APP_ID: "55555555-5555-4555-8555-555555555555" }],
+    ["organization", { KOYEB_ORGANIZATION_ID: "55555555-5555-4555-8555-555555555555" }],
+    ["region", { KOYEB_REGION: "fra" }],
+  ])("rejects private mesh when the runtime Koyeb %s identity differs", async (_label, drift) => {
     const capability = new KoyebResumableProvisioning(
-      { ...baseEnv, KOYEB_APP_ID: "55555555-5555-4555-8555-555555555555" },
+      { ...baseEnv, ...drift },
       vi.fn<typeof fetch>(),
     );
 
     await expect(capability.prepare(meshConfig(), lease())).rejects.toThrow(
       "Koyeb durable provisioning configuration unsupported",
     );
+  });
+
+  it("rejects private mesh when the runtime app name differs from its registered target", () => {
+    expect(
+      () =>
+        new KoyebResumableProvisioning(
+          managedAppPoolEnv({ KOYEB_APP_NAME: "different-app" }),
+          vi.fn<typeof fetch>(),
+        ),
+    ).toThrow("invalid Koyeb app target registry");
   });
 
   it("freezes an unrouted Koyeb private-mesh service without Tailscale material", async () => {

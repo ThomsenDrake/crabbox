@@ -105,6 +105,7 @@ export interface Env {
   CRABBOX_KOYEB_API_URL?: string;
   CRABBOX_KOYEB_ORGANIZATION_ID?: string;
   CRABBOX_KOYEB_APP_ID?: string;
+  CRABBOX_KOYEB_APP_TARGETS?: string;
   CRABBOX_KOYEB_REGION?: string;
   CRABBOX_KOYEB_INSTANCE_TYPE?: string;
   CRABBOX_KOYEB_IMAGE?: string;

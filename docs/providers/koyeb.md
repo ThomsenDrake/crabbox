@@ -52,6 +52,7 @@ override the transport default, including `false` for native mesh. An explicit
 KOYEB_API_TOKEN                         # coordinator-only API credential
 CRABBOX_KOYEB_ORGANIZATION_ID           # exact Koyeb organization UUID
 CRABBOX_KOYEB_APP_ID                    # existing application UUID
+CRABBOX_KOYEB_APP_TARGETS                # validated JSON registry for a managed app pool
 CRABBOX_KOYEB_IMAGE                     # runner image as tag@sha256:digest
 CRABBOX_KOYEB_API_URL                   # optional; default https://app.koyeb.com
 CRABBOX_KOYEB_REGION                    # optional; default was
@@ -69,12 +70,55 @@ value is the Koyeb secret name, not a credential or UUID. The coordinator sends
 the Koyeb token only to the Koyeb control plane and never stores it in a lease
 record or runner environment.
 
+Start a managed app pool with exactly two registered targets. Each entry binds
+an application UUID to its Koyeb name, organization, and region. The legacy
+`CRABBOX_KOYEB_APP_ID` must remain one of the entries; all entries must use the
+configured organization and region, and names and IDs must be unique.
+
+```json
+[
+  {
+    "organizationID": "33333333-3333-4333-8333-333333333333",
+    "appID": "44444444-4444-4444-8444-444444444444",
+    "appName": "my-app-workers-1",
+    "region": "was"
+  },
+  {
+    "organizationID": "33333333-3333-4333-8333-333333333333",
+    "appID": "66666666-6666-4666-8666-666666666666",
+    "appName": "my-app-workers-2",
+    "region": "was"
+  }
+]
+```
+
+Later additions are count-independent: append validated entries and use the
+ordinary coordinator configuration reload. Adding or reordering entries does
+not retarget existing leases. Admission freezes the selected application UUID,
+provider scope, and region into the durable lease and provisioning plan. A
+removed registration, a renamed application, or a live application identity
+that differs from its registration blocks further provider work for that
+target.
+
 Native mesh mode is selected per lease with `--tailscale=false`. It is
 available only when Koyeb's injected `KOYEB_APP_ID`, `KOYEB_APP_NAME`,
-`KOYEB_ORGANIZATION_ID`, and `KOYEB_REGION` identify the configured target app
-and region. This prevents an external or mis-targeted coordinator from
-publishing a private DNS name it cannot reach. See Koyeb's
+`KOYEB_ORGANIZATION_ID`, and `KOYEB_REGION` identify the coordinator's
+registered legacy app and region. A lease in another registered app uses the
+cross-app private hostname `<service>.<app-name>.internal`. This prevents an
+external or mis-targeted coordinator from publishing a private DNS name it
+cannot reach. See Koyeb's
 [service mesh and discovery documentation](https://www.koyeb.com/docs/reference/service-mesh-and-discovery).
+
+Managed-pool admission uses one organization-wide snapshot for every candidate
+application. It enforces per-app service capacity together with organization
+service count, provisioning concurrency, memory, allowed instance types and
+regions, and per-type instance limits. Durable leases that are not yet visible
+in provider inventory remain reservations, and an instance returned by the API
+continues to consume capacity even when its status is `ERROR`; list status alone
+does not prove termination. Missing, malformed, inconsistent, or drifted quota
+and usage evidence fails closed. A live `DATABASE` service also fails closed
+until its Neon deployment capacity can be proven to participate correctly in
+the organization's `memory_mb` quota.
 
 ## Lifecycle and access
 
@@ -148,6 +192,11 @@ A live lifecycle test is billable and requires valid coordinator, Koyeb,
 registry, and runner-image configuration. The default transport also requires
 Tailscale. Run it only against an empty dedicated application, then confirm the
 created service is deleted.
+
+The managed-pool implementation has production-shaped local coverage for
+cross-app routing and lifecycle ownership. Live cross-app private transport
+acceptance is still pending; local verification and a healthy deployment do not
+establish that acceptance.
 
 ## Related docs
 

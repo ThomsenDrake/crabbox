@@ -242,7 +242,10 @@ export class LeaseProvisioningController {
   constructor(
     private readonly runtime: CoordinatorRuntime,
     private readonly env: Env,
-    private readonly provider: (provider: Provider) => ProviderResumableProvisioning | undefined,
+    private readonly provider: (
+      provider: Provider,
+      lease: LeaseRecord,
+    ) => ProviderResumableProvisioning | undefined,
     private readonly publish: (
       transaction: CoordinatorStorageView,
       lease: LeaseRecord,
@@ -392,7 +395,7 @@ export class LeaseProvisioningController {
     const { operation, lease, plan, sealed } = claimed;
     let result: ProvisioningStep;
     try {
-      const capability = this.provider(operation.provider);
+      const capability = this.provider(operation.provider, lease);
       if (
         !capability ||
         !plan ||

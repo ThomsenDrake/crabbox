@@ -18,6 +18,18 @@ const observation = {
   exception: "value_error",
   errno: "none",
 };
+const homeEntry = {
+  schema: "crabbox-home-entry/v1",
+  event: "runner_home_entry",
+  operation: "pool_claim",
+  reference: "bootstrap",
+  field: "entry_added",
+  pathClass: "home_top_level",
+  count: "one",
+  entryClass: "ice_authority_candidate",
+  kind: "file",
+  payload: "empty",
+};
 
 it("retains only fixed diagnostic vocabulary and discards extra data", () => {
   expect(
@@ -45,6 +57,16 @@ it.each(["malformed synthetic-secret", "null", "[]", "{}"])(
     expect(projectPoolDiagnostic(line)).toEqual({ event: "runner_pool_diagnostic_unavailable" });
   },
 );
+
+it("retains only the strict runner HOME entry vocabulary", () => {
+  expect(projectPoolDiagnostic(JSON.stringify(homeEntry))).toEqual(homeEntry);
+  expect(projectPoolDiagnostic(JSON.stringify({ ...homeEntry, path: ".ICEauthority" }))).toEqual({
+    event: "runner_pool_diagnostic_unavailable",
+  });
+  expect(projectPoolDiagnostic(JSON.stringify({ ...homeEntry, kind: "directory" }))).toEqual({
+    event: "runner_pool_diagnostic_unavailable",
+  });
+});
 
 it("uses a valid isolated Python startup loader without a private-executor request", async () => {
   const commands: string[][] = [];
@@ -110,9 +132,11 @@ class PoolObserverTests(unittest.TestCase):
             error=None; results=[];lock=None
             try:
                 state.pool_baseline(control,home)
+                if enabled:observer.finish_projection()
                 results.append(state.pool_clean(control,work,home))
+                if enabled:observer.finish_projection()
                 if kind=="home":
-                    (home/"synthetic-private-file").write_text("synthetic-private-content")
+                    (home/".ICEauthority").write_bytes(b"")
                 if kind=="lock":
                     lock=os.open(control/"pool.lock",os.O_CREAT|os.O_RDWR,0o600)
                     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -128,6 +152,7 @@ class PoolObserverTests(unittest.TestCase):
                 except Exception as failure:
                     error=(type(failure).__name__,str(failure),getattr(failure,"errno",None))
             finally:
+                if enabled and kind=="home":observer.finish_projection()
                 sys.settrace(None)
                 if lock is not None:os.close(lock)
             marker=control/"pool-consumed.json"
@@ -144,24 +169,32 @@ class PoolObserverTests(unittest.TestCase):
         self.assertEqual(plain,observed)
         self.assertEqual(observed[1][0:2],("ValueError","runner home changed after clean bootstrap"))
         self.assertIsNone(observed[2])
-        self.assertTrue(any(r["stage"]=="home_integrity" and r["reason"]=="home_changed" for r in records))
+        self.assertTrue(any(r.get("stage")=="home_integrity" and r.get("reason")=="home_changed" for r in records))
+        self.assertEqual([r for r in records if r.get("event")=="runner_home_entry"],[
+            {"schema":"crabbox-home-entry/v1","event":"runner_home_entry","operation":"pool_claim",
+             "reference":"bootstrap","field":"entry_added","pathClass":"home_top_level","count":"one",
+             "entryClass":"ice_authority_candidate","kind":"file","payload":"empty"},
+            {"schema":"crabbox-home-entry/v1","event":"runner_home_entry","operation":"pool_claim",
+             "reference":"last_clean","field":"entry_added","pathClass":"home_top_level","count":"one",
+             "entryClass":"ice_authority_candidate","kind":"file","payload":"empty"},
+        ])
     def test_claim_replay_and_other_token_denial_remain_exact(self):
         plain,_=self.exercise("replay",False);observed,records=self.exercise("replay",True)
         self.assertEqual(plain,observed)
         self.assertEqual(observed[1][0:2],("ValueError","runner has already been consumed"))
         self.assertEqual([r["state"] for r in observed[0]],["clean","claimed","claimed"])
-        self.assertTrue(any(r["stage"]=="consumed_marker" and r["reason"]=="already_consumed" for r in records))
+        self.assertTrue(any(r.get("stage")=="consumed_marker" and r.get("reason")=="already_consumed" for r in records))
     def test_lock_failure_remains_terminal(self):
         plain,_=self.exercise("lock",False);observed,records=self.exercise("lock",True)
         self.assertEqual(plain,observed)
         self.assertIsNotNone(observed[1])
         self.assertIsNone(observed[2])
-        self.assertTrue(any(r["stage"]=="lock_acquire" and r["exception"]=="lock_blocked" for r in records))
+        self.assertTrue(any(r.get("stage")=="lock_acquire" and r.get("exception")=="lock_blocked" for r in records))
     def test_marker_sync_failure_preserves_error_and_redacts_message(self):
         plain,_=self.exercise("sync",False);observed,records=self.exercise("sync",True)
         self.assertEqual(plain,observed)
         self.assertEqual(observed[1][2],errno.EIO)
-        self.assertTrue(any(r["stage"]=="claim_marker_sync" and r["errno"]=="EIO" for r in records))
+        self.assertTrue(any(r.get("stage")=="claim_marker_sync" and r.get("errno")=="EIO" for r in records))
     def test_source_mismatch_disables_observer(self):
         with tempfile.TemporaryDirectory(prefix="crabbox-observer-mismatch-") as tmp:
             observer.OUTPUT=str(pathlib.Path(tmp)/"events.jsonl");observer.emitted=0

@@ -1716,6 +1716,41 @@ describe("Koyeb managed app targets", () => {
     );
   });
 
+  it("does not treat an external registered lease as a managed app reservation", async () => {
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: {
+        services_by_app: "2",
+        services: "2",
+        service_provisioning_concurrency: "2",
+        memory_mb: "8192",
+        max_instances_by_type: { large: "2" },
+      },
+      quotaUsage: {
+        services_used: 1,
+        memory_mb_used: 4096,
+        instances_by_type: [{ instance_type: "large", used: 1, limit: 2 }],
+      },
+    });
+    const storage = new ProvisioningTestStorage();
+    await storage.put(
+      "lease:registered-worker",
+      lease({
+        id: "registered-worker",
+        lifecycle: "registered",
+        state: "active",
+        createAttemptGeneration: undefined,
+      }),
+    );
+
+    const admitted = lease({ id: "cbx_managed000001" });
+    const selected = await capability.selectAdmission(storage, candidates, admitted);
+    Object.assign(admitted, candidates[selected]!.lease);
+    await storage.put(`lease:${admitted.id}`, admitted);
+    await expect(
+      capability.selectAdmission(storage, candidates, lease({ id: "cbx_managed000002" })),
+    ).rejects.toThrow("Koyeb organization capacity is exhausted");
+  });
+
   it.each(["provisioning", "released", "expired", "failed"] as const)(
     "keeps a %s durable reservation when provider inventory already looks healthy",
     async (state) => {
@@ -3316,6 +3351,57 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       `DELETE /v1/services/${serviceID}`,
     ]);
   });
+
+  it.each([
+    ["service", latestDeploymentID, deploymentID],
+    ["deployment", serviceID, latestDeploymentID],
+  ] as const)(
+    "refuses cleanup when an exact %s lookup returns another resource",
+    async (identity, returnedServiceID, returnedDeploymentID) => {
+      const methods: string[] = [];
+      const capability = new KoyebResumableProvisioning(baseEnv, async (request) => {
+        const incoming = request instanceof Request ? request : new Request(request);
+        const url = new URL(incoming.url);
+        methods.push(`${incoming.method} ${url.pathname}`);
+        if (url.pathname === `/v1/services/${serviceID}`) {
+          return Response.json({ service: service({ id: returnedServiceID }) });
+        }
+        if (url.pathname === `/v1/deployments/${deploymentID}`) {
+          return Response.json({
+            deployment: deployment("u".repeat(32), {
+              id: returnedDeploymentID,
+              service_id: returnedServiceID,
+            }),
+          });
+        }
+        throw new Error(`unexpected request ${incoming.method} ${incoming.url}`);
+      });
+      const prepared = await capability.prepare(config(), lease());
+
+      const error = await capability
+        .advance({
+          plan: prepared.plan,
+          step: {
+            ...prepared.step,
+            phase: "cleanup",
+            state: { version: 1, action: "delete", serviceID },
+          },
+          lease: lease({ providerScope: prepared.plan.scope, cloudID: serviceID }),
+          deadline: Date.now() + 60_000,
+          recovering: true,
+          canceled: true,
+        })
+        .then(
+          () => undefined,
+          (caught: unknown) => caught,
+        );
+      expect(methods.some((entry) => entry.startsWith("DELETE"))).toBe(false);
+      expect(error).toBeInstanceOf(ProviderResourceUnresolvedError);
+      expect(String(error)).toContain(
+        `Koyeb ${identity} response identity does not match its request`,
+      );
+    },
+  );
 
   it("waits without deleting when active and latest deployment identities differ", async () => {
     const methods: string[] = [];

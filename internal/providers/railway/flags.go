@@ -11,11 +11,11 @@ import (
 // intentionally not surfaced as a flag because secrets must not be passed as
 // command-line arguments; it is sourced from RAILWAY_API_TOKEN /
 // CRABBOX_RAILWAY_API_TOKEN.
-func RegisterRailwayProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterRailwayProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterRailwayConfigFlags(fs, defaults.Railway)
 }
 
-func ApplyRailwayProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplyRailwayProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "", ""); err != nil {
 			return err
@@ -25,6 +25,7 @@ func ApplyRailwayProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error 
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.Railway, fs)
-	return nil
+	applied, err := v.Apply(&cfg.Railway, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	return err
 }

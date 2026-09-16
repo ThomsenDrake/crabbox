@@ -45,7 +45,7 @@ func (a App) projectCheckpoint(ctx context.Context, args []string) error {
 		return err
 	}
 	if !readyPoolLeasePattern.MatchString(*id) || !*jsonOut {
-		return exit(2, "project-checkpoint requires --id and --json")
+		return Exit(2, "project-checkpoint requires --id and --json")
 	}
 	var input *ProjectCheckpointRequest
 	if *requestStdin {
@@ -54,16 +54,16 @@ func (a App) projectCheckpoint(ctx context.Context, args []string) error {
 		decoder := json.NewDecoder(reader)
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(input); err != nil || decoder.Decode(&struct{}{}) != io.EOF || reader.N <= 0 {
-			return exit(2, "invalid checkpoint request metadata")
+			return Exit(2, "invalid checkpoint request metadata")
 		}
 		switch input.Action {
 		case "bind", "capture", "restore", "record-loss":
 		case "discard":
 			if !input.ConfirmDiscard {
-				return exit(2, "discard requires explicit confirmDiscard")
+				return Exit(2, "discard requires explicit confirmDiscard")
 			}
 		default:
-			return exit(2, "unsupported checkpoint action")
+			return Exit(2, "unsupported checkpoint action")
 		}
 	}
 	coord, err := readyPoolCoordinator()
@@ -72,7 +72,7 @@ func (a App) projectCheckpoint(ctx context.Context, args []string) error {
 	}
 	response, err := coord.ProjectCheckpoint(ctx, *id, input)
 	if err != nil {
-		return exit(7, "project checkpoint operation failed; ordinary reclaim remains held until checkpoint acceptance or explicit loss/discard")
+		return Exit(7, "project checkpoint operation failed; ordinary reclaim remains held until checkpoint acceptance or explicit loss/discard")
 	}
 	return json.NewEncoder(a.Stdout).Encode(response)
 }

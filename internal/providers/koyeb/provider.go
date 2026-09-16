@@ -33,6 +33,9 @@ func (Provider) Aliases() []string { return nil }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication: core.ProviderAuthentication{
+			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; Koyeb credentials remain server-side."},
+		},
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,

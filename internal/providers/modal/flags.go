@@ -7,11 +7,11 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func RegisterModalProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterModalProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterModalConfigFlags(fs, defaults.Modal)
 }
 
-func ApplyModalProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplyModalProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if cfg.Provider == providerName {
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "", ""); err != nil {
 			return err
@@ -21,6 +21,7 @@ func ApplyModalProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.Modal, fs)
-	return nil
+	applied, err := v.Apply(&cfg.Modal, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	return err
 }

@@ -697,7 +697,13 @@ export class KoyebClient {
       allowNotFound: true,
     });
     if (result === undefined) return undefined;
-    return koyebService(asObject(result)["service"]);
+    const service = koyebService(asObject(result)["service"]);
+    if (service.id !== id) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb service response identity does not match its request",
+      );
+    }
+    return service;
   }
 
   async getDeployment(id: string): Promise<KoyebDeployment | undefined> {
@@ -706,7 +712,13 @@ export class KoyebClient {
       allowNotFound: true,
     });
     if (result === undefined) return undefined;
-    return koyebDeployment(asObject(result)["deployment"]);
+    const deployment = koyebDeployment(asObject(result)["deployment"]);
+    if (deployment.id !== id) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb deployment response identity does not match its request",
+      );
+    }
+    return deployment;
   }
 
   async createService(body: JSONRecord): Promise<KoyebService> {
@@ -1378,7 +1390,9 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     let provisioningServices = observedProvisioningServices.size;
     const reservations = [
       ...(await storage.list<LeaseRecord>({ prefix: "lease:" })).values(),
-    ].filter((reservation) => reservation.provider === "koyeb");
+    ].filter(
+      (reservation) => reservation.provider === "koyeb" && reservation.lifecycle !== "registered",
+    );
     for (const reservation of reservations) {
       if (
         ["released", "expired", "failed"].includes(reservation.state) &&

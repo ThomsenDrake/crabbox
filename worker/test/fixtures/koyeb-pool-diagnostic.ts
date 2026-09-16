@@ -92,6 +92,58 @@ const vocabulary = {
     "ENOTSUP",
   ],
 };
+const homeVocabulary = {
+  operation: ["baseline", "pool_check", "pool_claim"],
+  reference: ["bootstrap", "last_clean"],
+  reason: [
+    "changed",
+    "projection_missing",
+    "projection_invalid",
+    "projection_overflow",
+    "baseline_binding_changed",
+    "projection_exists",
+    "projection_error",
+    "unclassified_snapshot_mismatch",
+    "groups_omitted",
+  ],
+  pathClass: [
+    "home_cache",
+    "home_config",
+    "home_local_share",
+    "home_local_state",
+    "home_top_level",
+    "home_other",
+    "none",
+  ],
+  field: [
+    "entry_added",
+    "entry_removed",
+    "type",
+    "mode",
+    "file_content",
+    "symlink_target",
+    "order",
+    "top_level",
+    "none",
+  ],
+  count: ["none", "one", "two_to_eight", "nine_or_more"],
+};
+const referenceVocabulary = {
+  operation: ["baseline", "pool_check"],
+  reference: ["bootstrap", "last_clean"],
+  reason: ["projection_saved", "snapshot_not_captured"],
+};
+const entryVocabulary = {
+  schema: ["crabbox-home-entry/v1"],
+  operation: ["pool_claim"],
+  reference: ["bootstrap", "last_clean"],
+  field: ["entry_added"],
+  pathClass: ["home_top_level"],
+  count: ["one"],
+  entryClass: ["local_root", "x_authority_candidate", "ice_authority_candidate", "other_top_level"],
+  kind: ["file", "directory", "symlink"],
+  payload: ["empty", "nonempty", "not_applicable"],
+};
 
 export const unavailablePoolDiagnostic = () => ({ event: "runner_pool_diagnostic_unavailable" });
 
@@ -99,15 +151,46 @@ export const unavailablePoolDiagnostic = () => ({ event: "runner_pool_diagnostic
 // exception, path, profile, claim, content hash or credential into the CI log.
 export function projectPoolDiagnostic(line: string) {
   try {
+    if (new TextEncoder().encode(line).length > 8192) return unavailablePoolDiagnostic();
     const value: unknown = JSON.parse(line);
     if (!value || typeof value !== "object" || Array.isArray(value))
       return unavailablePoolDiagnostic();
-    const result: Record<string, string> = { event: "runner_pool_diagnostic" };
-    for (const [key, allowed] of Object.entries(vocabulary)) {
-      const field: unknown = (value as Record<string, unknown>)[key];
+    const record = value as Record<string, unknown>;
+    const home = record["event"] === "runner_home_comparison";
+    const reference = record["event"] === "runner_home_reference";
+    const entry = record["event"] === "runner_home_entry";
+    const result: Record<string, string> = {
+      event: entry
+        ? "runner_home_entry"
+        : reference
+          ? "runner_home_reference"
+          : home
+            ? "runner_home_comparison"
+            : "runner_pool_diagnostic",
+    };
+    const fields = entry
+      ? entryVocabulary
+      : reference
+        ? referenceVocabulary
+        : home
+          ? homeVocabulary
+          : vocabulary;
+    if (entry) {
+      const expected = ["event", ...Object.keys(fields)].toSorted();
+      if (Object.keys(record).toSorted().join("\0") !== expected.join("\0"))
+        return unavailablePoolDiagnostic();
+    }
+    for (const [key, allowed] of Object.entries(fields)) {
+      const field: unknown = record[key];
       if (typeof field !== "string" || !allowed.includes(field)) return unavailablePoolDiagnostic();
       result[key] = field;
     }
+    if (
+      entry &&
+      ((result.kind === "file" && result.payload === "not_applicable") ||
+        (result.kind !== "file" && result.payload !== "not_applicable"))
+    )
+      return unavailablePoolDiagnostic();
     return result;
   } catch {
     return unavailablePoolDiagnostic();

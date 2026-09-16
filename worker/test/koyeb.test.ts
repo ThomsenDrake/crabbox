@@ -12,7 +12,10 @@ import {
   koyebRegisteredAppIDs,
 } from "../src/koyeb";
 import {
+  cancelProvisioningOperation,
+  provisioningAttemptKey,
   provisioningOperationKey,
+  putProvisioningOperation,
   type LeaseProvisioningOperation,
 } from "../src/lease-provisioning";
 import { orgKeyForLabel } from "../src/org-identity";
@@ -1632,6 +1635,125 @@ describe("Koyeb managed app targets", () => {
       "Koyeb organization capacity is exhausted",
     );
   });
+
+  it.each(["provisioning", "released", "expired", "failed"] as const)(
+    "keeps a %s durable reservation when provider inventory already looks healthy",
+    async (state) => {
+      const targetServiceID = "77777777-7777-4777-8777-777777777777";
+      const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const { capability, candidates } = await managedCapacityCandidates({
+        quotas: { service_provisioning_concurrency: "1" },
+        services: [
+          service({
+            id: targetServiceID,
+            app_id: secondAppID,
+            active_deployment_id: targetDeploymentID,
+            latest_deployment_id: targetDeploymentID,
+          }),
+        ],
+        deployments: [capacityDeployment(targetDeploymentID, targetServiceID, secondAppID)],
+      });
+      const storage = new ProvisioningTestStorage();
+      const reservation = lease({
+        ...candidates[1]!.lease,
+        state,
+        cloudID: targetServiceID,
+        provisioningResourceMayExist: true,
+      });
+      await storage.put(`lease:${reservation.id}`, reservation);
+
+      await expect(capability.selectAdmission(storage, candidates, lease())).rejects.toThrow(
+        "Koyeb organization capacity is exhausted",
+      );
+    },
+  );
+
+  it("retains an uncertain canceled create across simultaneous admissions in both apps", async () => {
+    const { capability, candidates } = await managedCapacityCandidates({
+      quotas: { service_provisioning_concurrency: "2" },
+    });
+    const storage = new ProvisioningTestStorage();
+    const runtime = new ProvisioningTestRuntime(storage);
+    const reservation = lease({ ...candidates[0]!.lease });
+    const uncertain = { version: 1, action: "discover", outcomeUncertain: true };
+    const operation: LeaseProvisioningOperation = {
+      schema: 1,
+      leaseID: reservation.id,
+      operationID: "uncertain-create",
+      generation: reservation.createAttemptGeneration!,
+      scope: reservation.providerScope!,
+      owner: reservation.owner,
+      org: reservation.org,
+      provider: "koyeb",
+      createdAt: Date.now(),
+      deadline: Date.now() + 60_000,
+      revision: 0,
+      step: { phase: "provisioning", attempt: 0, state: uncertain, nextWake: Date.now() },
+    };
+    await runtime.commitAndWake(async (transaction) => {
+      await transaction.put(`lease:${reservation.id}`, reservation);
+      await putProvisioningOperation(transaction, operation);
+      await cancelProvisioningOperation(transaction, reservation, Date.now());
+    });
+    const canceled = await storage.get<LeaseRecord>(`lease:${reservation.id}`);
+    expect(canceled).toMatchObject({ state: "released", provisioningResourceMayExist: true });
+    const journalBefore = await storage.get(provisioningAttemptKey(operation));
+    expect(journalBefore).toMatchObject({ state: uncertain });
+    const operationBefore = await storage.get(provisioningOperationKey(reservation.id));
+    const admit = (id: string) =>
+      runtime.commitAndWake(async (transaction) => {
+        const requested = lease({ id });
+        const selected = await capability.selectAdmission(transaction, candidates, requested);
+        Object.assign(requested, candidates[selected]!.lease);
+        await transaction.put(`lease:${id}`, requested);
+        return requested.providerProject;
+      });
+
+    const results = await Promise.allSettled([
+      admit("cbx_000000000001"),
+      admit("cbx_000000000002"),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toEqual([
+      { status: "fulfilled", value: secondAppID },
+    ]);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((await storage.list({ prefix: "lease:" })).size).toBe(2);
+    expect(await storage.get(`lease:${reservation.id}`)).toEqual(canceled);
+    expect(await storage.get(provisioningAttemptKey(operation))).toEqual(journalBefore);
+    expect(await storage.get(provisioningOperationKey(reservation.id))).toEqual(operationBefore);
+  });
+
+  it.each(["STARTING", "HEALTHY"])(
+    "does not duplicate a visible %s service already bound in its durable lease",
+    async (status) => {
+      const targetServiceID = "77777777-7777-4777-8777-777777777777";
+      const targetDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const { capability, candidates } = await managedCapacityCandidates({
+        quotas: { service_provisioning_concurrency: status === "STARTING" ? "2" : "1" },
+        services: [
+          service({
+            id: targetServiceID,
+            status,
+            active_deployment_id: targetDeploymentID,
+            latest_deployment_id: targetDeploymentID,
+          }),
+        ],
+        deployments: [
+          capacityDeployment(targetDeploymentID, targetServiceID, baseEnv.CRABBOX_KOYEB_APP_ID!),
+        ],
+      });
+      const storage = new ProvisioningTestStorage();
+      const reservation = lease({
+        ...candidates[0]!.lease,
+        state: status === "STARTING" ? "provisioning" : "active",
+        cloudID: targetServiceID,
+      });
+      await storage.put(`lease:${reservation.id}`, reservation);
+
+      await expect(capability.selectAdmission(storage, candidates, lease())).resolves.toBe(1);
+    },
+  );
 
   it("rejects a durable lease whose observed service belongs to another registered app", async () => {
     const targetServiceID = "77777777-7777-4777-8777-777777777777";

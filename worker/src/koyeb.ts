@@ -1563,12 +1563,12 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
         target.headroom -= 1;
         organizationServices += 1;
       }
-      if (
-        reservation.state === "provisioning" &&
-        (!serviceID ||
-          (!observedProvisioningServices.has(serviceID) &&
-            !observedOrganizationServices.has(serviceID)))
-      ) {
+      // Publication commits the active lease and terminal operation together.
+      // Cancellation changes lease state before an uncertain create or cleanup
+      // settles, so every other unresolved state retains its durable slot.
+      // Only the same observed provisioning service can cover that slot;
+      // a HEALTHY inventory row does not prove durable publication or cleanup.
+      if (reservation.state !== "active" && !observedProvisioningServices.has(serviceID)) {
         provisioningServices += 1;
       }
       if (!serviceID || !memoryAccountedServices.has(serviceID)) {

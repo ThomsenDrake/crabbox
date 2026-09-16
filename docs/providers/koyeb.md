@@ -120,6 +120,17 @@ and usage evidence fails closed. A live `DATABASE` service also fails closed
 until its Neon deployment capacity can be proven to participate correctly in
 the organization's `memory_mb` quota.
 
+The existing coordinator transaction counts durable reservations across every
+registered app. An unresolved lease keeps its provisioning slot until durable
+publication makes it active or canonical evidence confirms no provider resource
+remains. Cancellation, failure, expiry, and a healthy provider listing do not
+release that slot. An observed provisioning service covers a reservation only
+when its service ID is already bound in the durable lease. Before publication,
+an ID retained only in the operation journal may be conservatively counted again.
+This bounds coordinator-owned work; it does not establish organization-wide
+headroom for external actors. That requires complete provider accounting or an
+authoritative atomic quota-enforcement contract, which remains unverified.
+
 ## Lifecycle and access
 
 1. The coordinator freezes the lease, runner image, placement, owner, SSH key,

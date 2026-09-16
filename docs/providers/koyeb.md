@@ -52,6 +52,7 @@ override the transport default, including `false` for native mesh. An explicit
 KOYEB_API_TOKEN                         # coordinator-only API credential
 CRABBOX_KOYEB_ORGANIZATION_ID           # exact Koyeb organization UUID
 CRABBOX_KOYEB_APP_ID                    # existing application UUID
+CRABBOX_KOYEB_APP_TARGETS                # validated JSON registry for a managed app pool
 CRABBOX_KOYEB_IMAGE                     # runner image as tag@sha256:digest
 CRABBOX_KOYEB_API_URL                   # optional; default https://app.koyeb.com
 CRABBOX_KOYEB_REGION                    # optional; default was
@@ -69,12 +70,81 @@ value is the Koyeb secret name, not a credential or UUID. The coordinator sends
 the Koyeb token only to the Koyeb control plane and never stores it in a lease
 record or runner environment.
 
+Start a managed app pool with exactly two registered targets. Each entry binds
+an application UUID to its Koyeb name, organization, and region. The legacy
+`CRABBOX_KOYEB_APP_ID` must remain one of the entries; all entries must use the
+configured organization and region, and names and IDs must be unique.
+
+```json
+[
+  {
+    "organizationID": "33333333-3333-4333-8333-333333333333",
+    "appID": "44444444-4444-4444-8444-444444444444",
+    "appName": "my-app-workers-1",
+    "region": "was"
+  },
+  {
+    "organizationID": "33333333-3333-4333-8333-333333333333",
+    "appID": "66666666-6666-4666-8666-666666666666",
+    "appName": "my-app-workers-2",
+    "region": "was"
+  }
+]
+```
+
+Later additions are count-independent: append validated entries and use the
+ordinary coordinator configuration reload. Adding or reordering entries does
+not retarget existing leases. Admission freezes the selected application UUID,
+provider scope, and region into the durable lease and provisioning plan. A
+removed registration, a renamed application, or a live application identity
+that differs from its registration blocks further provider work for that
+target.
+
 Native mesh mode is selected per lease with `--tailscale=false`. It is
 available only when Koyeb's injected `KOYEB_APP_ID`, `KOYEB_APP_NAME`,
-`KOYEB_ORGANIZATION_ID`, and `KOYEB_REGION` identify the configured target app
-and region. This prevents an external or mis-targeted coordinator from
-publishing a private DNS name it cannot reach. See Koyeb's
+`KOYEB_ORGANIZATION_ID`, and `KOYEB_REGION` identify the coordinator's
+registered legacy app and region. A lease in another registered app uses the
+cross-app private hostname `<service>.<app-name>.internal`. This prevents an
+external or mis-targeted coordinator from publishing a private DNS name it
+cannot reach. See Koyeb's
 [service mesh and discovery documentation](https://www.koyeb.com/docs/reference/service-mesh-and-discovery).
+
+Managed-pool admission uses the supported
+`GET /v1/quotas/organizations/{organization_id}/usage` response for organization
+service, memory, and configured instance-type usage. Its limits must agree with
+the organization quota endpoint. Allowed types and regions, per-app capacity,
+and per-type limits remain enforced. A zero type limit in usage means uncapped
+only when the quota map omits that type; an explicit zero quota remains
+exhausted. Direct app-scoped service listings count every service type for
+per-app occupancy. Aggregate memory accounting does not require attributing
+memory to a `DATABASE` service or inferring whether Neon is included. Missing,
+malformed, inconsistent, or drifted evidence fails closed, including conflicting
+app bindings for the same service UUID.
+
+Koyeb caches aggregate usage for 60 seconds and supplies neither service
+membership nor a source-generation timestamp. Admission rejects a snapshot
+more than 60 seconds after local receipt of the usage response. These windows
+can combine to nearly 120 seconds of source age, plus transport time; the local
+timestamp does not prove source freshness or atomicity with service creation.
+Every unresolved durable lease is therefore added to the aggregate service,
+memory, and instance-type counters, even when its service is visible or may
+already be included in those totals. Only canonical cleanup or no-resource
+evidence retires that reservation. Direct app membership can avoid counting
+the same service twice for per-app occupancy; it never reduces the aggregate
+overlay.
+
+The existing coordinator transaction counts durable reservations across every
+registered app. An unresolved lease keeps its provisioning slot until durable
+publication makes it active or canonical evidence confirms no provider resource
+remains. Cancellation, failure, expiry, and a healthy provider listing do not
+release that slot. Provisioning observations from the organization and each
+registered app are combined by service UUID, with deployment identity and
+status checked. An observed provisioning service covers a reservation only
+when its service ID is already bound in the durable lease. Before publication,
+an ID retained only in the operation journal may be conservatively counted again.
+This bounds coordinator-owned work; it does not establish organization-wide
+headroom for external actors. That requires complete provider accounting or an
+authoritative atomic quota-enforcement contract, which remains unverified.
 
 ## Lifecycle and access
 
@@ -148,6 +218,11 @@ A live lifecycle test is billable and requires valid coordinator, Koyeb,
 registry, and runner-image configuration. The default transport also requires
 Tailscale. Run it only against an empty dedicated application, then confirm the
 created service is deleted.
+
+The managed-pool implementation has production-shaped local coverage for
+cross-app routing and lifecycle ownership. Live cross-app private transport
+acceptance is still pending; local verification and a healthy deployment do not
+establish that acceptance.
 
 ## Related docs
 

@@ -1,11 +1,17 @@
 import type { LeaseConfig } from "./config";
+import type { CoordinatorStorageView } from "./coordinator-runtime";
 import { redactDiagnosticSecrets } from "./http";
+import {
+  leaseHasConfirmedNoProviderResource,
+  leaseProviderCleanupConfirmed,
+} from "./lease-cleanup";
 import { ProjectCheckpointError, projectCheckpointFailureCodes } from "./project-checkpoints";
 import { sshPublicKeyIdentity } from "./provider-key";
 import { providerLabelValue } from "./provider-labels";
 import {
   ProviderResourceUnresolvedError,
   type FrozenProvisioningPlan,
+  type ProviderProvisioningCandidate,
   type ProviderResumableProvisioning,
   type ProvisioningStep,
 } from "./provider-provisioning";
@@ -33,6 +39,8 @@ export const koyebPoolBootstrap = "clean-runner-v1";
 const pollInterval = 2_000;
 // An explicit coordinator observation budget, independent of any CLI/RPC deadline.
 const deletionConfirmationBudgetMs = 5 * 60_000;
+const koyebQuotaUsageCacheSeconds = 60;
+const capacitySnapshotLocalReuseMs = koyebQuotaUsageCacheSeconds * 1_000;
 const serviceStatuses = new Set([
   "STARTING",
   "HEALTHY",
@@ -43,6 +51,28 @@ const serviceStatuses = new Set([
   "PAUSING",
   "PAUSED",
   "RESUMING",
+]);
+const provisioningServiceStatuses = new Set(["STARTING", "DELETING", "PAUSING", "RESUMING"]);
+const provisioningDeploymentStatuses = new Set([
+  "PENDING",
+  "PROVISIONING",
+  "SCHEDULED",
+  "CANCELING",
+  "ALLOCATING",
+  "STARTING",
+  "STOPPING",
+  "ERRORING",
+]);
+const deploymentStatuses = new Set([
+  ...provisioningDeploymentStatuses,
+  "CANCELED",
+  "HEALTHY",
+  "DEGRADED",
+  "UNHEALTHY",
+  "STOPPED",
+  "ERROR",
+  "STASHED",
+  "SLEEPING",
 ]);
 const uuidPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const immutableImagePattern =
@@ -61,6 +91,50 @@ interface KoyebConfiguration {
   image: string;
   registrySecret?: string;
   appName?: string;
+  managedTarget: boolean;
+  readyPoolScope: string;
+}
+
+interface KoyebAppTarget {
+  organizationID: string;
+  appID: string;
+  appName: string;
+  region: string;
+}
+
+interface KoyebCapacitySnapshot {
+  servicesByApp: number;
+  organizationServices: number;
+  serviceProvisioningConcurrency: number;
+  memoryMB: number;
+  snapshotCapturedAt: number;
+  observedServiceIDs: string[];
+  observedAppProvisioningServiceIDs: string[];
+  observedOrganizationServiceIDs: string[];
+  organizationServicesUsed: number;
+  observedProvisioningServiceIDs: string[];
+  organizationMemoryMBUsed: number;
+  workerInstancesUsed: number;
+  workerInstanceLimit?: number;
+  workerMemoryMB: number;
+}
+
+interface KoyebOrganizationCapacitySnapshot extends Omit<
+  KoyebCapacitySnapshot,
+  "observedServiceIDs" | "observedAppProvisioningServiceIDs"
+> {
+  services: KoyebService[];
+  deployments: KoyebDeployment[];
+}
+
+interface KoyebQuotaUsageSnapshot {
+  receivedAt: number;
+  servicesUsed: number;
+  servicesLimit: number;
+  memoryMBUsed: number;
+  memoryMBLimit: number;
+  workerInstancesUsed: number;
+  workerInstanceLimit: number;
 }
 
 interface KoyebService {
@@ -91,6 +165,7 @@ interface KoyebProvisioningPlan {
   runnerLeaseID: string;
   organizationID: string;
   appID: string;
+  appName?: string;
   region: string;
   instanceType: string;
   image: string;
@@ -107,6 +182,8 @@ interface KoyebProvisioningPlan {
   privateHost?: string;
   tailscaleHostname: string;
   tailscaleTags: string[];
+  readyPoolScope?: string;
+  capacity?: KoyebCapacitySnapshot;
 }
 
 type KoyebAction = "dispatch" | "discover" | "observe" | "bootstrap" | "delete" | "confirm-delete";
@@ -165,17 +242,20 @@ export class KoyebClient {
   readonly image: string;
   readonly registrySecret?: string;
   readonly appName?: string;
+  readonly managedTarget: boolean;
+  readonly readyPoolScope: string;
   private readonly token: string;
 
   constructor(
     env: Env,
     private readonly fetcher: typeof fetch = fetch,
+    appID?: string,
   ) {
     const missing = koyebConfigurationMissing(env);
     if (missing.length) {
       throw new Error(`Koyeb coordinator configuration invalid or missing: ${missing.join(", ")}`);
     }
-    const configured = koyebConfiguration(env);
+    const configured = koyebConfiguration(env, appID);
     this.apiURL = configured.apiURL;
     this.token = configured.token;
     this.organizationID = configured.organizationID;
@@ -183,6 +263,8 @@ export class KoyebClient {
     this.region = configured.region;
     this.instanceType = configured.instanceType;
     this.image = configured.image;
+    this.managedTarget = configured.managedTarget;
+    this.readyPoolScope = configured.readyPoolScope;
     if (configured.registrySecret) this.registrySecret = configured.registrySecret;
     if (configured.appName) this.appName = configured.appName;
   }
@@ -201,10 +283,31 @@ export class KoyebClient {
   }
 
   async listServices(name?: string): Promise<KoyebService[]> {
+    return this.listServiceInventory({
+      appID: this.appID,
+      ...(name ? { name } : {}),
+      sandboxOnly: true,
+    });
+  }
+
+  async listAllServices(): Promise<KoyebService[]> {
+    return this.listServiceInventory({ appID: this.appID, sandboxOnly: false });
+  }
+
+  private async listOrganizationServices(): Promise<KoyebService[]> {
+    return this.listServiceInventory({ sandboxOnly: false });
+  }
+
+  private async listServiceInventory(options: {
+    appID?: string;
+    name?: string;
+    sandboxOnly: boolean;
+  }): Promise<KoyebService[]> {
     const limit = 100;
-    const query = new URLSearchParams({ app_id: this.appID, limit: String(limit) });
-    query.append("types", "SANDBOX");
-    if (name) query.set("name", name);
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (options.appID) query.set("app_id", options.appID);
+    if (options.sandboxOnly) query.append("types", "SANDBOX");
+    if (options.name) query.set("name", options.name);
     const inventory: KoyebService[] = [];
     const seen = new Set<string>();
     let offset = 0;
@@ -267,6 +370,304 @@ export class KoyebClient {
       if (!more) return inventory;
       offset = nextOffset;
     }
+  }
+
+  async validateTarget(): Promise<void> {
+    if (!this.managedTarget) return;
+    const result = asObject(
+      await this.apiRequest("GET", `/v1/apps/${encodeURIComponent(this.appID)}`),
+    );
+    const app = asObject(result["app"]);
+    if (
+      stringValue(app["id"]) !== this.appID ||
+      stringValue(app["name"]) !== this.appName ||
+      stringValue(app["organization_id"]) !== this.organizationID
+    ) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb app target identity does not match its registration",
+      );
+    }
+  }
+
+  private async quotas(): Promise<
+    Pick<
+      KoyebCapacitySnapshot,
+      | "servicesByApp"
+      | "organizationServices"
+      | "serviceProvisioningConcurrency"
+      | "memoryMB"
+      | "workerInstanceLimit"
+    >
+  > {
+    const response = asObject(
+      await this.apiRequest(
+        "GET",
+        `/v1/organizations/${encodeURIComponent(this.organizationID)}/quotas`,
+      ),
+    );
+    const quotas = asObject(response["quotas"]);
+    const servicesByApp = quotaInteger(quotas, "services_by_app");
+    const organizationServices = quotaInteger(quotas, "services");
+    const serviceProvisioningConcurrency = quotaInteger(quotas, "service_provisioning_concurrency");
+    const memoryMB = quotaInteger(quotas, "memory_mb");
+    const instanceTypes = quotaStrings(quotas, "instance_types");
+    const regions = quotaStrings(quotas, "regions");
+    const maxInstancesByType = quotaIntegerMap(quotas, "max_instances_by_type");
+    if (
+      servicesByApp === undefined ||
+      organizationServices === undefined ||
+      serviceProvisioningConcurrency === undefined ||
+      memoryMB === undefined ||
+      servicesByApp <= 0 ||
+      organizationServices <= 0 ||
+      serviceProvisioningConcurrency <= 0 ||
+      memoryMB <= 0
+    ) {
+      throw capacityEvidenceError("organization quota evidence is incomplete");
+    }
+    if (instanceTypes.length > 0 && !instanceTypes.includes(this.instanceType)) {
+      throw capacityEvidenceError("configured instance type is excluded by organization quota");
+    }
+    if (regions.length > 0 && !regions.includes(this.region)) {
+      throw capacityEvidenceError("configured region is excluded by organization quota");
+    }
+    const workerInstanceLimit = maxInstancesByType[this.instanceType];
+    return {
+      servicesByApp,
+      organizationServices,
+      serviceProvisioningConcurrency,
+      memoryMB,
+      ...(workerInstanceLimit === undefined ? {} : { workerInstanceLimit }),
+    };
+  }
+
+  private async quotaUsage(): Promise<KoyebQuotaUsageSnapshot> {
+    // Koyeb documents this response as cached for up to 60 seconds. The local
+    // capture timestamp only bounds coordinator reuse after this response; it
+    // does not establish provider-data age or atomicity with a later create.
+    const response = asObject(
+      await this.apiRequest(
+        "GET",
+        `/v1/quotas/organizations/${encodeURIComponent(this.organizationID)}/usage`,
+      ),
+    );
+    const receivedAt = Date.now();
+    const usage = asObject(response["usage"]);
+    const servicesUsed = usageInteger(usage, "services_used");
+    const servicesLimit = usageInteger(usage, "services_limit");
+    const memoryMBUsed = usageInteger(usage, "memory_mb_used");
+    const memoryMBLimit = usageInteger(usage, "memory_mb_limit");
+    const instancesByType = usage["instances_by_type"];
+    if (
+      servicesUsed === undefined ||
+      servicesLimit === undefined ||
+      memoryMBUsed === undefined ||
+      memoryMBLimit === undefined ||
+      servicesLimit <= 0 ||
+      memoryMBLimit <= 0 ||
+      !Array.isArray(instancesByType)
+    ) {
+      throw capacityEvidenceError("organization quota usage is incomplete");
+    }
+    const seen = new Set<string>();
+    let workerInstancesUsed: number | undefined;
+    let workerInstanceLimit: number | undefined;
+    for (const entry of instancesByType) {
+      const item = asObject(entry);
+      const instanceType = stringValue(item["instance_type"]);
+      const used = usageInteger(item, "used");
+      const limit = usageInteger(item, "limit");
+      if (
+        !validKoyebName(instanceType) ||
+        used === undefined ||
+        limit === undefined ||
+        seen.has(instanceType)
+      ) {
+        throw capacityEvidenceError("organization instance type usage is malformed");
+      }
+      seen.add(instanceType);
+      if (instanceType === this.instanceType) {
+        workerInstancesUsed = used;
+        workerInstanceLimit = limit;
+      }
+    }
+    if (workerInstancesUsed === undefined || workerInstanceLimit === undefined) {
+      throw capacityEvidenceError("configured instance type usage is missing");
+    }
+    return {
+      receivedAt,
+      servicesUsed,
+      servicesLimit,
+      memoryMBUsed,
+      memoryMBLimit,
+      workerInstancesUsed,
+      workerInstanceLimit,
+    };
+  }
+
+  private async listOrganizationDeployments(): Promise<KoyebDeployment[]> {
+    const limit = 100;
+    const inventory: KoyebDeployment[] = [];
+    const seen = new Set<string>();
+    let offset = 0;
+    let count: number | undefined;
+    for (;;) {
+      const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+      // oxlint-disable-next-line eslint/no-await-in-loop -- Each offset depends on the validated preceding page.
+      const value = asObject(await this.apiRequest("GET", `/v1/deployments?${query.toString()}`));
+      const deployments = value["deployments"];
+      if (!Array.isArray(deployments)) {
+        throw capacityEvidenceError("deployment inventory is malformed");
+      }
+      const pageLimit = inventoryInteger(value, "limit", "deployment") ?? limit;
+      const pageOffset = inventoryInteger(value, "offset", "deployment");
+      const pageCount = inventoryInteger(value, "count", "deployment");
+      const hasNext = value["has_next"];
+      if (
+        (hasNext !== undefined && typeof hasNext !== "boolean") ||
+        pageLimit === 0 ||
+        pageLimit > limit ||
+        deployments.length > pageLimit ||
+        (pageOffset !== undefined && pageOffset !== offset) ||
+        (pageCount !== undefined && count !== undefined && pageCount !== count)
+      ) {
+        throw capacityEvidenceError("deployment inventory pagination is malformed");
+      }
+      count = pageCount ?? count;
+      const nextOffset = offset + deployments.length;
+      if (
+        !Number.isSafeInteger(nextOffset) ||
+        (count !== undefined &&
+          (count < nextOffset ||
+            (hasNext === true && count === nextOffset) ||
+            (hasNext === false && count > nextOffset)))
+      ) {
+        throw capacityEvidenceError("deployment inventory pagination is inconsistent");
+      }
+      const more =
+        hasNext ?? (count !== undefined ? nextOffset < count : deployments.length === pageLimit);
+      if (more && nextOffset <= offset) {
+        throw capacityEvidenceError("deployment inventory pagination made no progress");
+      }
+      for (const entry of deployments) {
+        const deployment = koyebDeployment(entry);
+        if (
+          !uuidPattern.test(deployment.id) ||
+          !uuidPattern.test(deployment.organizationID) ||
+          !uuidPattern.test(deployment.appID) ||
+          !uuidPattern.test(deployment.serviceID) ||
+          deployment.organizationID !== this.organizationID ||
+          !deploymentStatuses.has(deployment.status)
+        ) {
+          throw capacityEvidenceError("deployment inventory is malformed");
+        }
+        const id = deployment.id.toLowerCase();
+        if (seen.has(id)) {
+          throw capacityEvidenceError("deployment inventory contains repeated deployment IDs");
+        }
+        seen.add(id);
+        inventory.push(deployment);
+      }
+      if (!more) return inventory;
+      offset = nextOffset;
+    }
+  }
+
+  private async catalogMemoryMB(instanceType: string): Promise<number> {
+    const response = asObject(
+      await this.apiRequest("GET", `/v1/catalog/instances/${encodeURIComponent(instanceType)}`),
+    );
+    const instance = asObject(response["instance"]);
+    if (stringValue(instance["id"]) !== instanceType) {
+      throw capacityEvidenceError("instance catalog identity is malformed");
+    }
+    const memoryMB = memoryStringMB(stringValue(instance["memory"]));
+    if (!memoryMB) throw capacityEvidenceError("instance catalog memory is malformed");
+    return memoryMB;
+  }
+
+  async organizationCapacitySnapshot(): Promise<KoyebOrganizationCapacitySnapshot> {
+    if (!this.managedTarget) {
+      throw capacityEvidenceError("managed target capacity is unavailable");
+    }
+    const [quotas, usage, services, deployments, workerMemoryMB] = await Promise.all([
+      this.quotas(),
+      this.quotaUsage(),
+      this.listOrganizationServices(),
+      this.listOrganizationDeployments(),
+      this.catalogMemoryMB(this.instanceType),
+    ]);
+    const expectedWorkerInstanceLimit = quotas.workerInstanceLimit ?? 0;
+    if (
+      usage.servicesLimit !== quotas.organizationServices ||
+      usage.memoryMBLimit !== quotas.memoryMB ||
+      usage.workerInstanceLimit !== expectedWorkerInstanceLimit
+    ) {
+      throw capacityEvidenceError("organization quota limits are inconsistent");
+    }
+    if (
+      services.some(
+        (service) =>
+          service.organizationID !== this.organizationID || !serviceStatuses.has(service.status),
+      )
+    ) {
+      throw capacityEvidenceError("organization service inventory is malformed");
+    }
+    const liveServices = services.filter((service) => service.status !== "DELETED");
+    const provisioningServiceIDs = observedProvisioningServiceIDs(liveServices, deployments);
+    const observedOrganizationServiceIDs = liveServices.map((service) => service.id);
+    return {
+      ...quotas,
+      snapshotCapturedAt: usage.receivedAt,
+      observedOrganizationServiceIDs,
+      organizationServicesUsed: usage.servicesUsed,
+      observedProvisioningServiceIDs: [...provisioningServiceIDs],
+      organizationMemoryMBUsed: usage.memoryMBUsed,
+      workerInstancesUsed: usage.workerInstancesUsed,
+      workerMemoryMB,
+      services: liveServices,
+      deployments,
+    };
+  }
+
+  async capacitySnapshot(
+    organization?: KoyebOrganizationCapacitySnapshot,
+  ): Promise<KoyebCapacitySnapshot | undefined> {
+    if (!this.managedTarget) return undefined;
+    if (!organization) throw capacityEvidenceError("organization capacity evidence is missing");
+    const [, services] = await Promise.all([this.validateTarget(), this.listAllServices()]);
+    if (
+      services.some(
+        (service) =>
+          service.organizationID !== this.organizationID ||
+          service.appID !== this.appID ||
+          !serviceStatuses.has(service.status),
+      )
+    ) {
+      throw capacityEvidenceError("app service inventory is malformed");
+    }
+    const liveServices = services.filter((service) => service.status !== "DELETED");
+    const organizationServicesByID = new Map(
+      organization.services.map((service) => [service.id.toLowerCase(), service]),
+    );
+    if (
+      liveServices.some((service) => {
+        const organizationService = organizationServicesByID.get(service.id.toLowerCase());
+        return (
+          organizationService !== undefined &&
+          (organizationService.organizationID !== service.organizationID ||
+            organizationService.appID !== service.appID)
+        );
+      })
+    ) {
+      throw capacityEvidenceError("app service inventory conflicts with organization inventory");
+    }
+    const { deployments, services: _organizationServices, ...sharedCapacity } = organization;
+    return {
+      ...sharedCapacity,
+      observedServiceIDs: liveServices.map((service) => service.id),
+      observedAppProvisioningServiceIDs: observedProvisioningServiceIDs(liveServices, deployments),
+    };
   }
 
   async listCrabboxServers(): Promise<ProviderMachine[]> {
@@ -398,12 +799,20 @@ export class KoyebClient {
       lease.provider !== "koyeb" ||
       !uuidPattern.test(lease.cloudID) ||
       lease.providerScope !== scope ||
+      (this.managedTarget &&
+        lease.providerProject !== undefined &&
+        lease.providerProject !== this.appID) ||
+      (!this.managedTarget &&
+        lease.providerProject !== undefined &&
+        lease.providerProject !== this.appID) ||
+      (lease.region !== undefined && lease.region !== this.region) ||
       !lease.createAttemptGeneration
     ) {
       throw new ProviderResourceUnresolvedError(
         "Koyeb lease cleanup identity is incomplete or belongs to another context",
       );
     }
+    await this.validateTarget();
     const service = await this.getService(lease.cloudID);
     if (!service) return undefined;
     const plan = planForLeaseCleanup(this, lease);
@@ -428,7 +837,7 @@ export class KoyebClient {
       image.source !== "explicit" ||
       image.id !== this.image ||
       image.region !== lease.region ||
-      image.scope !== koyebReadyPoolScope(this) ||
+      image.scope !== this.readyPoolScope ||
       image.sourceID !== this.registrySecret
     )
       return undefined;
@@ -439,7 +848,7 @@ export class KoyebClient {
     return (
       identity.provider === "koyeb" &&
       identity.id === this.image &&
-      identity.scope === koyebReadyPoolScope(this)
+      identity.scope === this.readyPoolScope
     );
   }
 
@@ -797,9 +1206,28 @@ function managementBlockedReason(error: unknown): string {
 export class KoyebResumableProvisioning implements ProviderResumableProvisioning {
   readonly version = 1 as const;
   private readonly client: KoyebClient;
+  private readonly clients: KoyebClient[];
+  private readonly privateMeshAvailable: boolean;
 
-  constructor(env: Env, fetcher: typeof fetch = fetch) {
-    this.client = new KoyebClient(env, fetcher);
+  constructor(env: Env, fetcher: typeof fetch = fetch, targetAppID?: string) {
+    const registered = koyebAppTargets(env);
+    const appIDs = targetAppID
+      ? [targetAppID]
+      : (registered?.map((target) => target.appID) ?? [env.CRABBOX_KOYEB_APP_ID!.trim()]);
+    this.clients = appIDs.map((appID) => new KoyebClient(env, fetcher, appID));
+    this.client = this.clients[0]!;
+    this.privateMeshAvailable = koyebPrivateMeshAvailable(env);
+  }
+
+  private clientForPlan(plan: FrozenProvisioningPlan): KoyebClient {
+    const appID = stringValue(asObject(plan.data)["appID"]);
+    const client = this.clients.find((candidate) => candidate.appID === appID);
+    if (!client) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb provisioning target registration is missing",
+      );
+    }
+    return client;
   }
 
   supports(config: LeaseConfig): boolean {
@@ -807,21 +1235,16 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       config.provider === "koyeb" &&
       config.target === "linux" &&
       config.architecture === "amd64" &&
-      (config.tailscale || Boolean(this.client.privateHost("crabbox"))) &&
+      (config.tailscale ||
+        (this.privateMeshAvailable &&
+          this.clients.every((client) => Boolean(client.privateHost("crabbox"))))) &&
       !config.tailscaleExitNode &&
       config.serverType === this.client.instanceType &&
       config.workRoot === workRoot
     );
   }
 
-  async prepare(
-    config: LeaseConfig,
-    lease: LeaseRecord,
-  ): Promise<{
-    plan: FrozenProvisioningPlan;
-    material: { adminPassword: string; bootstrap: string; providerSecret: string };
-    step: ProvisioningStep;
-  }> {
+  async prepare(config: LeaseConfig, lease: LeaseRecord) {
     if (!this.supports(config))
       throw new Error("Koyeb durable provisioning configuration unsupported");
     if (!lease.createAttemptGeneration) {
@@ -830,63 +1253,243 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     if (config.tailscale && (!config.tailscaleAuthKey || config.tailscaleAuthKey.length > 4096)) {
       throw new Error("Koyeb provisioning requires a bounded one-off Tailscale auth key");
     }
-    const scope = await this.client.providerScope();
     const serviceName = leaseProviderName(lease.id, lease.slug);
     const transport: KoyebTransport = config.tailscale ? "tailscale" : "koyeb-mesh";
-    const privateHost =
-      transport === "koyeb-mesh" ? this.client.privateHost(serviceName) : undefined;
-    if (transport === "koyeb-mesh" && !privateHost) {
-      throw new Error("Koyeb private-mesh identity is unavailable");
+    const organizationCapacity = this.client.managedTarget
+      ? await this.client.organizationCapacitySnapshot()
+      : undefined;
+    const candidates = await Promise.all(
+      this.clients.map(async (client): Promise<ProviderProvisioningCandidate> => {
+        const [scope, capacity] = await Promise.all([
+          client.providerScope(),
+          client.capacitySnapshot(organizationCapacity),
+        ]);
+        const privateHost =
+          transport === "koyeb-mesh" ? client.privateHost(serviceName) : undefined;
+        if (transport === "koyeb-mesh" && !privateHost) {
+          throw new Error("Koyeb private-mesh identity is unavailable");
+        }
+        const data: KoyebProvisioningPlan = {
+          version: 1,
+          serviceName,
+          runnerLeaseID: serviceName,
+          organizationID: client.organizationID,
+          appID: client.appID,
+          ...(client.managedTarget && client.appName ? { appName: client.appName } : {}),
+          region: client.region,
+          instanceType: client.instanceType,
+          image: client.image,
+          ...(client.registrySecret ? { registrySecret: client.registrySecret } : {}),
+          leaseID: lease.id,
+          slug: lease.slug ?? "",
+          owner: lease.providerOwner || lease.owner,
+          org: lease.org,
+          generation: lease.createAttemptGeneration!,
+          ttlSeconds: lease.ttlSeconds,
+          idleTimeoutSeconds: lease.idleTimeoutSeconds ?? lease.ttlSeconds,
+          sshPublicKey: config.sshPublicKey,
+          transport,
+          ...(privateHost ? { privateHost } : {}),
+          tailscaleHostname: config.tailscaleHostname,
+          tailscaleTags: [...config.tailscaleTags],
+          ...(client.managedTarget ? { readyPoolScope: client.readyPoolScope } : {}),
+          ...(capacity ? { capacity } : {}),
+        };
+        return {
+          plan: {
+            version: 1,
+            provider: "koyeb",
+            scope,
+            resources: [{ cloudID: serviceName, region: client.region, scope }],
+            data,
+          },
+          material: {
+            adminPassword: randomSecret(),
+            bootstrap: transport === "tailscale" ? config.tailscaleAuthKey : "",
+            providerSecret: randomSecret(),
+          },
+          step: {
+            phase: "prepared",
+            attempt: 0,
+            state: { version: 1, action: "dispatch" } satisfies KoyebContinuationState,
+            nextWake: Date.now(),
+          },
+          lease: { providerScope: scope, providerProject: client.appID, region: client.region },
+        };
+      }),
+    );
+    const first = candidates[0]!;
+    return { ...first, candidates };
+  }
+
+  async selectAdmission(
+    storage: CoordinatorStorageView,
+    candidates: readonly ProviderProvisioningCandidate[],
+    _lease: LeaseRecord,
+  ): Promise<number> {
+    if (!candidates.length) throw new Error("Koyeb app capacity exhausted");
+    if (candidates.length === 1 && !(candidates[0]!.plan.data as KoyebProvisioningPlan).capacity) {
+      return 0;
     }
-    const data: KoyebProvisioningPlan = {
-      version: 1,
-      serviceName,
-      runnerLeaseID: serviceName,
-      organizationID: this.client.organizationID,
-      appID: this.client.appID,
-      region: this.client.region,
-      instanceType: this.client.instanceType,
-      image: this.client.image,
-      ...(this.client.registrySecret ? { registrySecret: this.client.registrySecret } : {}),
-      leaseID: lease.id,
-      slug: lease.slug ?? "",
-      owner: lease.providerOwner || lease.owner,
-      org: lease.org,
-      generation: lease.createAttemptGeneration,
-      ttlSeconds: lease.ttlSeconds,
-      idleTimeoutSeconds: lease.idleTimeoutSeconds ?? lease.ttlSeconds,
-      sshPublicKey: config.sshPublicKey,
-      transport,
-      ...(privateHost ? { privateHost } : {}),
-      tailscaleHostname: config.tailscaleHostname,
-      tailscaleTags: [...config.tailscaleTags],
-    };
-    return {
-      plan: {
-        version: 1,
-        provider: "koyeb",
-        scope,
-        resources: [{ cloudID: serviceName, region: this.client.region, scope }],
+    const available = candidates.map((candidate, index) => {
+      const data = candidate.plan.data as KoyebProvisioningPlan;
+      const capacity = data.capacity;
+      if (!capacity) return { index, data, scope: candidate.plan.scope, headroom: 1 };
+      if (!validCapacitySnapshot(capacity)) {
+        throw new ProviderResourceUnresolvedError("Koyeb app capacity inventory is invalid");
+      }
+      return {
+        index,
         data,
-      },
-      material: {
-        adminPassword: randomSecret(),
-        bootstrap: transport === "tailscale" ? config.tailscaleAuthKey : "",
-        providerSecret: randomSecret(),
-      },
-      step: {
-        phase: "prepared",
-        attempt: 0,
-        state: { version: 1, action: "dispatch" } satisfies KoyebContinuationState,
-        nextWake: Date.now(),
-      },
-    };
+        scope: candidate.plan.scope,
+        headroom: capacity.servicesByApp - capacity.observedServiceIDs.length,
+      };
+    });
+    const baseline = available[0]!.data.capacity;
+    if (
+      !baseline ||
+      available.some(
+        (candidate) =>
+          !candidate.data.capacity || !sameOrganizationCapacity(baseline, candidate.data.capacity),
+      )
+    ) {
+      throw new ProviderResourceUnresolvedError(
+        "Koyeb organization capacity evidence is inconsistent",
+      );
+    }
+    const snapshotAge = Date.now() - baseline.snapshotCapturedAt;
+    if (snapshotAge < 0 || snapshotAge > capacitySnapshotLocalReuseMs) {
+      throw new ProviderResourceUnresolvedError("Koyeb organization capacity snapshot is stale");
+    }
+    let organizationServices = baseline.organizationServicesUsed;
+    let memoryMB = baseline.organizationMemoryMBUsed;
+    let workerInstances = baseline.workerInstancesUsed;
+    const observedOrganizationServices = new Set(
+      baseline.observedOrganizationServiceIDs.map((id) => id.toLowerCase()),
+    );
+    const observedProvisioningServices = new Set(
+      baseline.observedProvisioningServiceIDs.map((id) => id.toLowerCase()),
+    );
+    for (const candidate of available) {
+      for (const serviceID of candidate.data.capacity!.observedAppProvisioningServiceIDs) {
+        observedProvisioningServices.add(serviceID.toLowerCase());
+      }
+    }
+    let provisioningServices = observedProvisioningServices.size;
+    const reservations = [
+      ...(await storage.list<LeaseRecord>({ prefix: "lease:" })).values(),
+    ].filter((reservation) => reservation.provider === "koyeb");
+    for (const reservation of reservations) {
+      if (
+        ["released", "expired", "failed"].includes(reservation.state) &&
+        leaseHasConfirmedNoProviderResource(reservation)
+      ) {
+        continue;
+      }
+      const target = available.find(
+        (candidate) =>
+          reservation.providerProject === candidate.data.appID ||
+          (!reservation.providerProject && reservation.providerScope === candidate.scope),
+      );
+      if (!target) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb durable lease target registration is missing",
+        );
+      }
+      if (
+        reservation.providerScope !== target.scope ||
+        reservation.region !== target.data.region ||
+        reservation.serverType !== target.data.instanceType
+      ) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb durable lease target identity does not match its registration",
+        );
+      }
+      if (leaseProviderCleanupConfirmed(reservation)) {
+        const evidence = reservation.providerCleanup;
+        if (!evidence) continue;
+        // Canonical completion is committed only after provider cleanup verifies
+        // the allocation digest. Completion clears access, so reconstructing the
+        // original plan from its host would change native mesh into Tailscale.
+        // Retain structural and lease/resource checks without re-deriving that
+        // already-verified digest from mutable access fields.
+        if (
+          evidence.provider === "koyeb" &&
+          evidence.confirmation &&
+          /^[a-f0-9]{64}$/.test(evidence.allocationSHA256) &&
+          validKoyebCleanupEvidence(evidence, reservation, evidence.allocationSHA256)
+        ) {
+          continue;
+        }
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb completed cleanup evidence does not match its durable lease identity",
+        );
+      }
+      const serviceID = reservation.cloudID.toLowerCase();
+      if (serviceID && !uuidPattern.test(serviceID)) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb durable lease service identity is invalid",
+        );
+      }
+      const directlyObservedTargets = serviceID
+        ? available.filter((candidate) =>
+            candidate.data.capacity!.observedServiceIDs.some(
+              (observedServiceID) => observedServiceID.toLowerCase() === serviceID,
+            ),
+          )
+        : [];
+      const observedInTargetApp =
+        directlyObservedTargets.length === 1 && directlyObservedTargets[0] === target;
+      if (
+        serviceID &&
+        !observedInTargetApp &&
+        (observedOrganizationServices.has(serviceID) || directlyObservedTargets.length > 0)
+      ) {
+        throw new ProviderResourceUnresolvedError(
+          "Koyeb durable lease service identity does not match its target app",
+        );
+      }
+      if (!serviceID || !observedInTargetApp) {
+        target.headroom -= 1;
+      }
+      // The aggregate usage response is cached and carries no resource membership
+      // or membership timestamp. Every unresolved durable lease is therefore
+      // overlaid conservatively, even when a visible service has the same ID.
+      organizationServices += 1;
+      // Publication commits the active lease and terminal operation together.
+      // Cancellation changes lease state before an uncertain create or cleanup
+      // settles, so every other unresolved state retains its durable slot.
+      // Only the same observed provisioning service can cover that slot;
+      // a HEALTHY inventory row does not prove durable publication or cleanup.
+      if (reservation.state !== "active" && !observedProvisioningServices.has(serviceID)) {
+        provisioningServices += 1;
+      }
+      memoryMB += baseline.workerMemoryMB;
+      workerInstances += 1;
+    }
+    if (
+      organizationServices >= baseline.organizationServices ||
+      provisioningServices >= baseline.serviceProvisioningConcurrency ||
+      memoryMB + baseline.workerMemoryMB > baseline.memoryMB ||
+      (baseline.workerInstanceLimit !== undefined &&
+        workerInstances >= baseline.workerInstanceLimit)
+    ) {
+      throw new ProviderResourceUnresolvedError("Koyeb organization capacity is exhausted");
+    }
+    let selected: (typeof available)[number] | undefined;
+    for (const candidate of available) {
+      if (candidate.headroom <= 0) continue;
+      if (!selected || candidate.headroom > selected.headroom) selected = candidate;
+    }
+    if (!selected) throw new Error("Koyeb app capacity exhausted");
+    return selected.index;
   }
 
   async advance(
     input: Parameters<ProviderResumableProvisioning["advance"]>[0],
   ): Promise<ProvisioningStep> {
-    const plan = await validatedPlan(this.client, input.plan, input.lease);
+    const client = this.clientForPlan(input.plan);
+    const plan = await validatedPlan(client, input.plan, input.lease);
     const state = continuationState(input.step.state);
     if (
       input.canceled ||
@@ -894,7 +1497,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       input.step.phase === "settling" ||
       input.step.phase === "retained"
     ) {
-      return this.cleanup(input, plan, state);
+      return this.cleanup(client, input, plan, state);
     }
     if (
       !input.material.providerSecret ||
@@ -910,7 +1513,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     });
 
     if (state.action === "dispatch" || state.action === "discover") {
-      const discovery = await discoverService(this.client, plan, input.material.providerSecret);
+      const discovery = await discoverService(client, plan, input.material.providerSecret);
       if (discovery.kind === "conflict") {
         return { ...output("blocked"), blockedReason: "identity_resolution_required" };
       }
@@ -926,7 +1529,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
         return { ...output("blocked"), blockedReason: "dispatch_outcome_unresolved" };
       }
       try {
-        const created = await this.client.createService(
+        const created = await client.createService(
           createServiceRequest(plan, input.material.providerSecret),
         );
         if (!serviceMatchesPlan(created, plan) || !uuidPattern.test(created.id)) {
@@ -949,7 +1552,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     }
     if (state.action === "observe") {
       const observation = await observeByID(
-        this.client,
+        client,
         plan,
         state.serviceID,
         input.material.providerSecret,
@@ -983,7 +1586,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       return { ...output("blocked"), blockedReason: "continuation_state_invalid" };
     }
     const observation = await observeByID(
-      this.client,
+      client,
       plan,
       state.serviceID,
       input.material.providerSecret,
@@ -1008,12 +1611,12 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     }
     let run: { stdout: string; stderr: string; code: number };
     try {
-      await this.client.managementHealth(
+      await client.managementHealth(
         management.baseURL,
         management.routingKey,
         input.material.providerSecret,
       );
-      await this.client.managementWriteFile(
+      await client.managementWriteFile(
         management.baseURL,
         management.routingKey,
         input.material.providerSecret,
@@ -1034,7 +1637,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
               CRABBOX_KOYEB_PRIVATE_HOST: plan.privateHost!,
             }),
       };
-      run = await this.client.managementRun(
+      run = await client.managementRun(
         management.baseURL,
         management.routingKey,
         input.material.providerSecret,
@@ -1066,7 +1669,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     }
     if (plan.transport === "koyeb-mesh") {
       try {
-        await this.client.managementBindPort(
+        await client.managementBindPort(
           management.baseURL,
           management.routingKey,
           input.material.providerSecret,
@@ -1127,6 +1730,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
   }
 
   private async cleanup(
+    client: KoyebClient,
     input: Parameters<ProviderResumableProvisioning["advance"]>[0],
     plan: KoyebProvisioningPlan,
     state: KoyebContinuationState,
@@ -1139,7 +1743,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
     });
     if (state.action === "dispatch" && !input.recovering) return output("terminal", 1);
     if (state.action === "dispatch" || state.action === "discover") {
-      const discovery = await discoverService(this.client, plan);
+      const discovery = await discoverService(client, plan);
       if (discovery.kind === "missing") {
         state.action = "discover";
         state.outcomeUncertain = true;
@@ -1156,7 +1760,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       return { ...output("blocked"), blockedReason: "identity_resolution_required" };
     }
     if (state.action === "confirm-delete") {
-      const service = await this.client.getService(state.serviceID);
+      const service = await client.getService(state.serviceID);
       if (!service || service.status === "DELETED") return output("terminal", 1);
       if (!serviceMatchesPlan(service, plan)) {
         return { ...output("blocked"), blockedReason: "identity_resolution_required" };
@@ -1164,7 +1768,7 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
       return output("cleanup");
     }
     if (state.action === "delete") {
-      const observation = await observeByID(this.client, plan, state.serviceID);
+      const observation = await observeByID(client, plan, state.serviceID);
       if (observation.kind === "missing") return output("terminal", 1);
       if (observation.kind !== "owned") {
         return {
@@ -1175,13 +1779,13 @@ export class KoyebResumableProvisioning implements ProviderResumableProvisioning
         };
       }
       try {
-        await this.client.deleteService(state.serviceID);
+        await client.deleteService(state.serviceID);
       } finally {
         state.action = "confirm-delete";
       }
       return output("cleanup", 1);
     }
-    const observation = await observeByID(this.client, plan, state.serviceID);
+    const observation = await observeByID(client, plan, state.serviceID);
     if (observation.kind === "missing") return output("terminal", 1);
     if (observation.kind === "conflict") {
       return { ...output("blocked"), blockedReason: "identity_resolution_required" };
@@ -1221,6 +1825,13 @@ export function koyebConfigurationMissing(env: Env): string[] {
   if (!validKoyebName(env.CRABBOX_KOYEB_INSTANCE_TYPE?.trim() || defaultInstanceType)) {
     missing.push("CRABBOX_KOYEB_INSTANCE_TYPE");
   }
+  if (env.CRABBOX_KOYEB_APP_TARGETS !== undefined) {
+    try {
+      koyebAppTargets(env);
+    } catch {
+      missing.push("CRABBOX_KOYEB_APP_TARGETS");
+    }
+  }
   return [...new Set(missing)];
 }
 
@@ -1237,20 +1848,105 @@ export function koyebPrivateMeshAvailable(env: Env): boolean {
   );
 }
 
-function koyebConfiguration(env: Env): KoyebConfiguration {
+function koyebConfiguration(env: Env, requestedAppID?: string): KoyebConfiguration {
   const registrySecret = env.CRABBOX_KOYEB_REGISTRY_SECRET?.trim();
-  const appName = koyebPrivateMeshAvailable(env) ? env.KOYEB_APP_NAME!.trim() : undefined;
+  const targets = koyebAppTargets(env);
+  const legacyAppID = env.CRABBOX_KOYEB_APP_ID!.trim();
+  const organizationID = env.CRABBOX_KOYEB_ORGANIZATION_ID!.trim();
+  const region = env.CRABBOX_KOYEB_REGION?.trim() || defaultRegion;
+  const instanceType = env.CRABBOX_KOYEB_INSTANCE_TYPE?.trim() || defaultInstanceType;
+  const selectedAppID = requestedAppID?.trim() || legacyAppID;
+  const target = targets?.find((candidate) => candidate.appID === selectedAppID);
+  if (targets && !target) {
+    throw new ProviderResourceUnresolvedError("Koyeb app target registration is missing");
+  }
+  if (!targets && selectedAppID !== legacyAppID) {
+    throw new ProviderResourceUnresolvedError("Koyeb app target registration is missing");
+  }
+  const appName =
+    target?.appName ??
+    (selectedAppID === legacyAppID && koyebPrivateMeshAvailable(env)
+      ? env.KOYEB_APP_NAME!.trim()
+      : undefined);
   return {
     apiURL: canonicalAPIURL(env.CRABBOX_KOYEB_API_URL),
     token: env.KOYEB_API_TOKEN!.trim(),
-    organizationID: env.CRABBOX_KOYEB_ORGANIZATION_ID!.trim(),
-    appID: env.CRABBOX_KOYEB_APP_ID!.trim(),
-    region: env.CRABBOX_KOYEB_REGION?.trim() || defaultRegion,
-    instanceType: env.CRABBOX_KOYEB_INSTANCE_TYPE?.trim() || defaultInstanceType,
+    organizationID,
+    appID: selectedAppID,
+    region,
+    instanceType,
     image: env.CRABBOX_KOYEB_IMAGE!.trim(),
     ...(registrySecret ? { registrySecret } : {}),
     ...(appName ? { appName } : {}),
+    managedTarget: Boolean(targets),
+    readyPoolScope: koyebReadyPoolScope({
+      organizationID,
+      appID: legacyAppID,
+      region,
+      instanceType,
+    }),
   };
+}
+
+function koyebAppTargets(env: Env): KoyebAppTarget[] | undefined {
+  if (env.CRABBOX_KOYEB_APP_TARGETS === undefined) return undefined;
+  const encoded = env.CRABBOX_KOYEB_APP_TARGETS;
+  if (!encoded || encoded !== encoded.trim()) throw new Error("invalid Koyeb app target registry");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch {
+    throw new Error("invalid Koyeb app target registry");
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("invalid Koyeb app target registry");
+  }
+  const organizationID = env.CRABBOX_KOYEB_ORGANIZATION_ID?.trim() ?? "";
+  const legacyAppID = env.CRABBOX_KOYEB_APP_ID?.trim() ?? "";
+  const region = env.CRABBOX_KOYEB_REGION?.trim() || defaultRegion;
+  const targets: KoyebAppTarget[] = [];
+  const appIDs = new Set<string>();
+  const appNames = new Set<string>();
+  for (const value of parsed) {
+    const entry = asObject(value);
+    if (
+      !hasOnlyKeys(entry, ["organizationID", "appID", "appName", "region"]) ||
+      Object.keys(entry).length !== 4
+    ) {
+      throw new Error("invalid Koyeb app target registry");
+    }
+    const target = {
+      organizationID: stringValue(entry["organizationID"]),
+      appID: stringValue(entry["appID"]),
+      appName: stringValue(entry["appName"]),
+      region: stringValue(entry["region"]),
+    };
+    if (
+      !uuidPattern.test(target.organizationID) ||
+      !uuidPattern.test(target.appID) ||
+      !validKoyebName(target.appName) ||
+      !validKoyebName(target.region) ||
+      target.organizationID !== organizationID ||
+      target.region !== region ||
+      appIDs.has(target.appID.toLowerCase()) ||
+      appNames.has(target.appName)
+    ) {
+      throw new Error("invalid Koyeb app target registry");
+    }
+    appIDs.add(target.appID.toLowerCase());
+    appNames.add(target.appName);
+    targets.push(target);
+  }
+  const legacy = targets.find((target) => target.appID === legacyAppID);
+  if (!legacy) throw new Error("invalid Koyeb app target registry");
+  if (koyebPrivateMeshAvailable(env) && legacy.appName !== env.KOYEB_APP_NAME!.trim()) {
+    throw new Error("invalid Koyeb app target registry");
+  }
+  return targets;
+}
+
+export function koyebRegisteredAppIDs(env: Env): string[] {
+  return koyebAppTargets(env)?.map((target) => target.appID) ?? [env.CRABBOX_KOYEB_APP_ID!.trim()];
 }
 
 function canonicalAPIURL(value: string | undefined): string {
@@ -1276,6 +1972,84 @@ function validKoyebSecretName(value: string): boolean {
   return value.length >= 2 && validKoyebName(value);
 }
 
+function validCapacitySnapshot(value: KoyebCapacitySnapshot): boolean {
+  if (
+    !Array.isArray(value.observedServiceIDs) ||
+    !Array.isArray(value.observedAppProvisioningServiceIDs) ||
+    !Array.isArray(value.observedOrganizationServiceIDs) ||
+    !Array.isArray(value.observedProvisioningServiceIDs)
+  ) {
+    return false;
+  }
+  const serviceIDs = [
+    ...value.observedServiceIDs,
+    ...value.observedAppProvisioningServiceIDs,
+    ...value.observedOrganizationServiceIDs,
+    ...value.observedProvisioningServiceIDs,
+  ];
+  const organizationServiceIDs = new Set(
+    value.observedOrganizationServiceIDs.map((id) => id.toLowerCase()),
+  );
+  const appServiceIDs = new Set(value.observedServiceIDs.map((id) => id.toLowerCase()));
+  return (
+    Number.isSafeInteger(value.servicesByApp) &&
+    value.servicesByApp > 0 &&
+    Number.isSafeInteger(value.organizationServices) &&
+    value.organizationServices > 0 &&
+    Number.isSafeInteger(value.serviceProvisioningConcurrency) &&
+    value.serviceProvisioningConcurrency > 0 &&
+    Number.isSafeInteger(value.memoryMB) &&
+    value.memoryMB > 0 &&
+    Number.isSafeInteger(value.snapshotCapturedAt) &&
+    value.snapshotCapturedAt > 0 &&
+    Number.isSafeInteger(value.organizationServicesUsed) &&
+    value.organizationServicesUsed >= 0 &&
+    Number.isSafeInteger(value.organizationMemoryMBUsed) &&
+    value.organizationMemoryMBUsed >= 0 &&
+    Number.isSafeInteger(value.workerInstancesUsed) &&
+    value.workerInstancesUsed >= 0 &&
+    (value.workerInstanceLimit === undefined ||
+      (Number.isSafeInteger(value.workerInstanceLimit) && value.workerInstanceLimit >= 0)) &&
+    Number.isSafeInteger(value.workerMemoryMB) &&
+    value.workerMemoryMB > 0 &&
+    serviceIDs.every((id) => uuidPattern.test(id)) &&
+    value.observedProvisioningServiceIDs.every((id) =>
+      organizationServiceIDs.has(id.toLowerCase()),
+    ) &&
+    value.observedAppProvisioningServiceIDs.every((id) => appServiceIDs.has(id.toLowerCase())) &&
+    appServiceIDs.size === value.observedServiceIDs.length &&
+    new Set(value.observedAppProvisioningServiceIDs.map((id) => id.toLowerCase())).size ===
+      value.observedAppProvisioningServiceIDs.length &&
+    organizationServiceIDs.size === value.observedOrganizationServiceIDs.length &&
+    new Set(value.observedProvisioningServiceIDs.map((id) => id.toLowerCase())).size ===
+      value.observedProvisioningServiceIDs.length
+  );
+}
+
+function sameOrganizationCapacity(
+  left: KoyebCapacitySnapshot,
+  right: KoyebCapacitySnapshot,
+): boolean {
+  return (
+    left.servicesByApp === right.servicesByApp &&
+    left.organizationServices === right.organizationServices &&
+    left.serviceProvisioningConcurrency === right.serviceProvisioningConcurrency &&
+    left.memoryMB === right.memoryMB &&
+    left.snapshotCapturedAt === right.snapshotCapturedAt &&
+    left.organizationServicesUsed === right.organizationServicesUsed &&
+    left.organizationMemoryMBUsed === right.organizationMemoryMBUsed &&
+    left.workerInstancesUsed === right.workerInstancesUsed &&
+    left.workerInstanceLimit === right.workerInstanceLimit &&
+    left.workerMemoryMB === right.workerMemoryMB &&
+    sameStrings(left.observedOrganizationServiceIDs, right.observedOrganizationServiceIDs) &&
+    sameStrings(left.observedProvisioningServiceIDs, right.observedProvisioningServiceIDs)
+  );
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 async function validatedPlan(
   client: KoyebClient,
   frozen: FrozenProvisioningPlan,
@@ -1290,6 +2064,8 @@ async function validatedPlan(
   const scope = await client.providerScope();
   const resource = frozen.resources[0];
   const privateHost = client.privateHost(data.serviceName ?? "");
+  const registeredPlan =
+    data.appName !== undefined || data.readyPoolScope !== undefined || data.capacity !== undefined;
   if (
     frozen.version !== 1 ||
     frozen.provider !== "koyeb" ||
@@ -1304,12 +2080,17 @@ async function validatedPlan(
     resource.region !== data.region ||
     data.organizationID !== client.organizationID ||
     data.appID !== client.appID ||
-    !validKoyebName(data.region ?? "") ||
+    data.region !== client.region ||
+    (registeredPlan && data.appName !== client.appName) ||
+    (registeredPlan && data.readyPoolScope !== client.readyPoolScope) ||
+    (data.capacity !== undefined && !validCapacitySnapshot(data.capacity)) ||
     !validKoyebName(data.instanceType ?? "") ||
     !immutableImagePattern.test(data.image ?? "") ||
     (data.registrySecret !== undefined && !validKoyebSecretName(data.registrySecret)) ||
     lease.provider !== "koyeb" ||
     lease.providerScope !== scope ||
+    (registeredPlan && lease.providerProject !== client.appID) ||
+    (registeredPlan && lease.region !== client.region) ||
     data.leaseID !== lease.id ||
     data.slug !== (lease.slug ?? "") ||
     data.owner !== (lease.providerOwner || lease.owner) ||
@@ -1334,6 +2115,7 @@ async function validatedPlan(
   ) {
     throw new Error("Koyeb provisioning plan is invalid or belongs to another context");
   }
+  await client.validateTarget();
   return data as KoyebProvisioningPlan;
 }
 
@@ -1752,7 +2534,7 @@ function imageIdentity(plan: KoyebProvisioningPlan): LeaseImageIdentity {
     provider: "koyeb",
     kind: imageKind,
     region: plan.region,
-    scope: koyebReadyPoolScope(plan),
+    scope: plan.readyPoolScope ?? koyebReadyPoolScope(plan),
     ...(plan.registrySecret ? { sourceID: plan.registrySecret } : {}),
   };
 }
@@ -1907,6 +2689,7 @@ function planForLeaseCleanup(client: KoyebClient, lease: LeaseRecord): KoyebProv
     runnerLeaseID: serviceName,
     organizationID: client.organizationID,
     appID: client.appID,
+    ...(lease.providerProject && client.appName ? { appName: client.appName } : {}),
     region,
     instanceType: lease.serverType,
     image: image.id,
@@ -1923,6 +2706,7 @@ function planForLeaseCleanup(client: KoyebClient, lease: LeaseRecord): KoyebProv
     ...(privateHost ? { privateHost } : {}),
     tailscaleHostname: lease.tailscale?.hostname || leaseProviderName(lease.id, lease.slug),
     tailscaleTags: lease.tailscale?.tags?.length ? [...lease.tailscale.tags] : ["tag:crabbox"],
+    ...(lease.providerProject ? { readyPoolScope: client.readyPoolScope } : {}),
   };
 }
 
@@ -2000,14 +2784,121 @@ function inventoryMachine(
 function inventoryInteger(
   value: JSONRecord,
   field: "limit" | "offset" | "count",
+  subject = "service",
 ): number | undefined {
   const raw = value[field];
   if (raw === undefined) return undefined;
   const parsed = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : raw;
   if (typeof parsed !== "number" || !Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`koyeb service inventory ${field} is malformed`);
+    throw new Error(`koyeb ${subject} inventory ${field} is malformed`);
   }
   return parsed;
+}
+
+function quotaInteger(value: JSONRecord, field: string): number | undefined {
+  const raw = value[field];
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function usageInteger(value: JSONRecord, field: string): number | undefined {
+  const raw = value[field];
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
+}
+
+function quotaStrings(value: JSONRecord, field: string): string[] {
+  const raw = value[field];
+  if (raw === undefined) return [];
+  if (
+    !Array.isArray(raw) ||
+    raw.some((entry) => typeof entry !== "string" || !validKoyebName(entry)) ||
+    new Set(raw).size !== raw.length
+  ) {
+    throw capacityEvidenceError(`organization ${field} quota is malformed`);
+  }
+  return raw;
+}
+
+function quotaIntegerMap(value: JSONRecord, field: string): Record<string, number> {
+  const raw = value[field];
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw capacityEvidenceError(`organization ${field} quota is malformed`);
+  }
+  const parsed: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(raw)) {
+    if (!validKoyebName(key) || typeof entry !== "string" || !/^\d+$/.test(entry)) {
+      throw capacityEvidenceError(`organization ${field} quota is malformed`);
+    }
+    const count = Number(entry);
+    if (!Number.isSafeInteger(count)) {
+      throw capacityEvidenceError(`organization ${field} quota is malformed`);
+    }
+    parsed[key] = count;
+  }
+  return parsed;
+}
+
+function capacityEvidenceError(detail: string): ProviderResourceUnresolvedError {
+  return new ProviderResourceUnresolvedError(`Koyeb ${detail}`);
+}
+
+function observedProvisioningServiceIDs(
+  services: readonly KoyebService[],
+  deployments: readonly KoyebDeployment[],
+): string[] {
+  const deploymentsByID = new Map(
+    deployments.map((deployment) => [deployment.id.toLowerCase(), deployment]),
+  );
+  const observed = new Set(
+    services
+      .filter((service) => provisioningServiceStatuses.has(service.status))
+      .map((service) => service.id.toLowerCase()),
+  );
+  for (const service of services) {
+    const deploymentIDs = [service.activeDeploymentID, service.latestDeploymentID].filter(
+      (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
+    );
+    if (deploymentIDs.length === 0 || deploymentIDs.some((id) => !uuidPattern.test(id))) {
+      throw capacityEvidenceError("service deployment identity is unresolved");
+    }
+    if (
+      service.activeDeploymentID &&
+      service.latestDeploymentID &&
+      service.activeDeploymentID !== service.latestDeploymentID
+    ) {
+      observed.add(service.id.toLowerCase());
+    }
+    for (const deploymentID of deploymentIDs) {
+      const deployment = deploymentsByID.get(deploymentID.toLowerCase());
+      if (
+        !deployment ||
+        deployment.id !== deploymentID ||
+        deployment.organizationID !== service.organizationID ||
+        deployment.appID !== service.appID ||
+        deployment.serviceID !== service.id
+      ) {
+        throw capacityEvidenceError("service deployment inventory is inconsistent");
+      }
+      if (provisioningDeploymentStatuses.has(deployment.status)) {
+        observed.add(service.id.toLowerCase());
+      }
+    }
+  }
+  return [...observed];
+}
+
+function memoryStringMB(value: string): number | undefined {
+  const match = /^(\d+)(B|KB|MB|GB|TB)$/i.exec(value.trim());
+  if (!match) return undefined;
+  const quantity = Number(match[1]);
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) return undefined;
+  const multiplier = { B: 1 / (1024 * 1024), KB: 1 / 1024, MB: 1, GB: 1024, TB: 1024 * 1024 }[
+    match[2]!.toUpperCase()
+  ];
+  const memoryMB = quantity * multiplier!;
+  return Number.isSafeInteger(memoryMB) && memoryMB > 0 ? memoryMB : undefined;
 }
 
 function koyebService(value: unknown): KoyebService {

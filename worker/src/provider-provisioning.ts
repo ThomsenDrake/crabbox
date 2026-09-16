@@ -51,6 +51,24 @@ export interface ProvisioningStep {
   blockedReason?: string;
 }
 
+export interface ProviderProvisioningCandidate {
+  plan: FrozenProvisioningPlan;
+  material: ProvisioningMaterial;
+  step: ProvisioningStep;
+  lease: Pick<LeaseRecord, "providerScope"> &
+    Partial<Pick<LeaseRecord, "providerProject" | "region">>;
+}
+
+export interface ProviderProvisioningPreparation {
+  plan: FrozenProvisioningPlan;
+  material: ProvisioningMaterial;
+  step: ProvisioningStep;
+  // Providers with more than one immutable allocation context expose every
+  // candidate before admission so material can be sealed outside the retried
+  // transaction. The first three fields retain the single-candidate contract.
+  candidates?: ProviderProvisioningCandidate[];
+}
+
 export interface ProviderResumableProvisioning {
   version: 1;
   supports(config: LeaseConfig): boolean;
@@ -59,14 +77,12 @@ export interface ProviderResumableProvisioning {
     plan: FrozenProvisioningPlan,
     lease: LeaseRecord,
   ): Promise<void>;
-  prepare(
-    config: LeaseConfig,
+  selectAdmission?(
+    storage: CoordinatorStorageView,
+    candidates: readonly ProviderProvisioningCandidate[],
     lease: LeaseRecord,
-  ): Promise<{
-    plan: FrozenProvisioningPlan;
-    material: ProvisioningMaterial;
-    step: ProvisioningStep;
-  }>;
+  ): Promise<number>;
+  prepare(config: LeaseConfig, lease: LeaseRecord): Promise<ProviderProvisioningPreparation>;
   advance(
     input: {
       plan: FrozenProvisioningPlan;

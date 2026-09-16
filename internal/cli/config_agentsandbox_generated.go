@@ -4,7 +4,6 @@ package cli
 
 import (
 	"flag"
-	"os"
 	"time"
 )
 
@@ -45,92 +44,21 @@ func defaultAgentSandboxConfig() AgentSandboxConfig {
 
 // AgentSandboxConfigApplied records accepted assignments during one application.
 type AgentSandboxConfigApplied struct {
+	InputAccepted   bool
 	Kubeconfig      bool
 	DeleteOnRelease bool
 }
 
 func (cfg *AgentSandboxConfig) applyFile(file *fileAgentSandboxConfig, trusted bool) (AgentSandboxConfigApplied, error) {
 	var applied AgentSandboxConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if trusted && file.Kubectl != "" {
-		cfg.Kubectl = file.Kubectl
-	}
-	if trusted && file.Kubeconfig != "" {
-		cfg.Kubeconfig = file.Kubeconfig
-		applied.Kubeconfig = true
-	}
-	if trusted && file.Context != "" {
-		cfg.Context = file.Context
-	}
-	if trusted && file.Namespace != "" {
-		cfg.Namespace = file.Namespace
-	}
-	if trusted && file.WarmPool != "" {
-		cfg.WarmPool = file.WarmPool
-	}
-	if trusted && file.Container != "" {
-		cfg.Container = file.Container
-	}
-	if trusted && file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.SandboxReadyTimeout != "" {
-		applyLeaseDuration(&cfg.SandboxReadyTimeout, file.SandboxReadyTimeout)
-	}
-	if file.PodReadyTimeout != "" {
-		applyLeaseDuration(&cfg.PodReadyTimeout, file.PodReadyTimeout)
-	}
-	if file.ExecTimeoutSecs != nil {
-		if *file.ExecTimeoutSecs < 0 {
-			return applied, exit(2, "agentSandbox execTimeoutSecs must be non-negative")
-		}
-		cfg.ExecTimeoutSecs = *file.ExecTimeoutSecs
-	}
-	if file.DeleteOnRelease != nil {
-		cfg.DeleteOnRelease = *file.DeleteOnRelease
-		applied.DeleteOnRelease = true
-	}
-	if file.ForgetMissing != nil {
-		cfg.ForgetMissing = *file.ForgetMissing
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, trusted, "agentSandbox")
+	return applied, err
 }
 
 func (cfg *AgentSandboxConfig) applyEnv() (AgentSandboxConfigApplied, error) {
 	var applied AgentSandboxConfigApplied
-	cfg.Kubectl = getenv("CRABBOX_AGENT_SANDBOX_KUBECTL", cfg.Kubectl)
-	if value, ok := firstNonEmptyEnv("CRABBOX_AGENT_SANDBOX_KUBECONFIG"); ok {
-		cfg.Kubeconfig = value
-		applied.Kubeconfig = true
-	}
-	cfg.Context = getenv("CRABBOX_AGENT_SANDBOX_CONTEXT", cfg.Context)
-	cfg.Namespace = getenv("CRABBOX_AGENT_SANDBOX_NAMESPACE", cfg.Namespace)
-	cfg.WarmPool = getenv("CRABBOX_AGENT_SANDBOX_WARM_POOL", cfg.WarmPool)
-	cfg.Container = getenv("CRABBOX_AGENT_SANDBOX_CONTAINER", cfg.Container)
-	cfg.Workdir = getenv("CRABBOX_AGENT_SANDBOX_WORKDIR", cfg.Workdir)
-	if value := os.Getenv("CRABBOX_AGENT_SANDBOX_SANDBOX_READY_TIMEOUT"); value != "" {
-		applyLeaseDuration(&cfg.SandboxReadyTimeout, value)
-	}
-	if value := os.Getenv("CRABBOX_AGENT_SANDBOX_POD_READY_TIMEOUT"); value != "" {
-		applyLeaseDuration(&cfg.PodReadyTimeout, value)
-	}
-	{
-		var err error
-		cfg.ExecTimeoutSecs, err = getenvNonNegativeInt("CRABBOX_AGENT_SANDBOX_EXEC_TIMEOUT_SECS", cfg.ExecTimeoutSecs)
-		if err != nil {
-			return applied, err
-		}
-	}
-	if value, ok := getenvBool("CRABBOX_AGENT_SANDBOX_DELETE_ON_RELEASE"); ok {
-		cfg.DeleteOnRelease = value
-		applied.DeleteOnRelease = true
-	}
-	if value, ok := getenvBool("CRABBOX_AGENT_SANDBOX_FORGET_MISSING"); ok {
-		cfg.ForgetMissing = value
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 12)
+	return applied, err
 }
 
 // AgentSandboxConfigFlagValues holds parsed values; only visited flags are applied.
@@ -151,20 +79,9 @@ type AgentSandboxConfigFlagValues struct {
 
 // RegisterAgentSandboxConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterAgentSandboxConfigFlags(fs *flag.FlagSet, defaults AgentSandboxConfig) AgentSandboxConfigFlagValues {
-	return AgentSandboxConfigFlagValues{
-		Kubectl:             fs.String("agent-sandbox-kubectl", defaults.Kubectl, "kubectl binary or path"),
-		Kubeconfig:          fs.String("agent-sandbox-kubeconfig", defaults.Kubeconfig, "Kubernetes kubeconfig path"),
-		Context:             fs.String("agent-sandbox-context", defaults.Context, "Kubernetes context"),
-		Namespace:           fs.String("agent-sandbox-namespace", defaults.Namespace, "Kubernetes namespace"),
-		WarmPool:            fs.String("agent-sandbox-warm-pool", defaults.WarmPool, "Agent Sandbox SandboxWarmPool name"),
-		Container:           fs.String("agent-sandbox-container", defaults.Container, "container name for exec/tar operations (empty = default container)"),
-		Workdir:             fs.String("agent-sandbox-workdir", defaults.Workdir, "absolute working directory inside the sandbox"),
-		SandboxReadyTimeout: fs.Duration("agent-sandbox-sandbox-ready-timeout", defaults.SandboxReadyTimeout, "SandboxClaim/Sandbox readiness timeout"),
-		PodReadyTimeout:     fs.Duration("agent-sandbox-pod-ready-timeout", defaults.PodReadyTimeout, "sandbox pod readiness timeout"),
-		ExecTimeoutSecs:     fs.Int("agent-sandbox-exec-timeout-secs", defaults.ExecTimeoutSecs, "command timeout in seconds (0 = no provider deadline)"),
-		DeleteOnRelease:     fs.Bool("agent-sandbox-delete-on-release", defaults.DeleteOnRelease, "delete the SandboxClaim on release"),
-		ForgetMissing:       fs.Bool("agent-sandbox-forget-missing", defaults.ForgetMissing, "remove the local claim when stop sees a missing Kubernetes claim"),
-	}
+	var values AgentSandboxConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // AgentSandboxConfigVisitedFlags records raw flag visits, independently of application.
@@ -175,53 +92,14 @@ type AgentSandboxConfigVisitedFlags struct {
 
 // AgentSandboxConfigFlagPresence reports visits for tracked flag bindings.
 func AgentSandboxConfigFlagPresence(fs *flag.FlagSet) AgentSandboxConfigVisitedFlags {
-	return AgentSandboxConfigVisitedFlags{
-		Kubeconfig:      flagWasSet(fs, "agent-sandbox-kubeconfig"),
-		DeleteOnRelease: flagWasSet(fs, "agent-sandbox-delete-on-release"),
-	}
+	var visited AgentSandboxConfigVisitedFlags
+	recordConfigFlagVisits[AgentSandboxConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values AgentSandboxConfigFlagValues) Apply(cfg *AgentSandboxConfig, fs *flag.FlagSet) AgentSandboxConfigApplied {
+func (values AgentSandboxConfigFlagValues) Apply(cfg *AgentSandboxConfig, fs *flag.FlagSet) (AgentSandboxConfigApplied, error) {
 	var applied AgentSandboxConfigApplied
-	visited := AgentSandboxConfigFlagPresence(fs)
-	if flagWasSet(fs, "agent-sandbox-kubectl") {
-		cfg.Kubectl = *values.Kubectl
-	}
-	if visited.Kubeconfig {
-		cfg.Kubeconfig = *values.Kubeconfig
-		applied.Kubeconfig = true
-	}
-	if flagWasSet(fs, "agent-sandbox-context") {
-		cfg.Context = *values.Context
-	}
-	if flagWasSet(fs, "agent-sandbox-namespace") {
-		cfg.Namespace = *values.Namespace
-	}
-	if flagWasSet(fs, "agent-sandbox-warm-pool") {
-		cfg.WarmPool = *values.WarmPool
-	}
-	if flagWasSet(fs, "agent-sandbox-container") {
-		cfg.Container = *values.Container
-	}
-	if flagWasSet(fs, "agent-sandbox-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "agent-sandbox-sandbox-ready-timeout") {
-		cfg.SandboxReadyTimeout = *values.SandboxReadyTimeout
-	}
-	if flagWasSet(fs, "agent-sandbox-pod-ready-timeout") {
-		cfg.PodReadyTimeout = *values.PodReadyTimeout
-	}
-	if flagWasSet(fs, "agent-sandbox-exec-timeout-secs") {
-		cfg.ExecTimeoutSecs = *values.ExecTimeoutSecs
-	}
-	if visited.DeleteOnRelease {
-		cfg.DeleteOnRelease = *values.DeleteOnRelease
-		applied.DeleteOnRelease = true
-	}
-	if flagWasSet(fs, "agent-sandbox-forget-missing") {
-		cfg.ForgetMissing = *values.ForgetMissing
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

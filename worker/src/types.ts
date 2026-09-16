@@ -809,6 +809,7 @@ export interface LeaseImageIdentity {
   scope?: string;
   sourceID?: string;
   promotedAt?: string;
+  revision?: string;
 }
 
 // Request-local observations; never persisted or used to authorize provider access.

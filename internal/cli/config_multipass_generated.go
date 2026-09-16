@@ -4,7 +4,6 @@ package cli
 
 import (
 	"flag"
-	"os"
 	"time"
 )
 
@@ -39,68 +38,22 @@ func defaultMultipassConfig() MultipassConfig {
 
 // MultipassConfigApplied records accepted assignments during one application.
 type MultipassConfigApplied struct {
-	Image    bool
-	User     bool
-	WorkRoot bool
+	InputAccepted bool
+	Image         bool
+	User          bool
+	WorkRoot      bool
 }
 
 func (cfg *MultipassConfig) applyFile(file *fileMultipassConfig) (MultipassConfigApplied, error) {
 	var applied MultipassConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.CLIPath != "" {
-		cfg.CLIPath = file.CLIPath
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-		applied.Image = true
-	}
-	if file.User != "" {
-		cfg.User = file.User
-		applied.User = true
-	}
-	if file.WorkRoot != "" {
-		cfg.WorkRoot = file.WorkRoot
-		applied.WorkRoot = true
-	}
-	if file.CPUs > 0 {
-		cfg.CPUs = file.CPUs
-	}
-	if file.Memory != "" {
-		cfg.Memory = file.Memory
-	}
-	if file.Disk != "" {
-		cfg.Disk = file.Disk
-	}
-	if file.LaunchTimeout != "" {
-		applyLeaseDuration(&cfg.LaunchTimeout, file.LaunchTimeout)
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "multipass")
+	return applied, err
 }
 
 func (cfg *MultipassConfig) applyEnv() (MultipassConfigApplied, error) {
 	var applied MultipassConfigApplied
-	cfg.CLIPath = getenv("CRABBOX_MULTIPASS_CLI", cfg.CLIPath)
-	if value, ok := firstNonEmptyEnv("CRABBOX_MULTIPASS_IMAGE"); ok {
-		cfg.Image = value
-		applied.Image = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_MULTIPASS_USER"); ok {
-		cfg.User = value
-		applied.User = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_MULTIPASS_WORK_ROOT"); ok {
-		cfg.WorkRoot = value
-		applied.WorkRoot = true
-	}
-	cfg.CPUs = getenvInt("CRABBOX_MULTIPASS_CPUS", cfg.CPUs)
-	cfg.Memory = getenv("CRABBOX_MULTIPASS_MEMORY", cfg.Memory)
-	cfg.Disk = getenv("CRABBOX_MULTIPASS_DISK", cfg.Disk)
-	if value := os.Getenv("CRABBOX_MULTIPASS_LAUNCH_TIMEOUT"); value != "" {
-		applyLeaseDuration(&cfg.LaunchTimeout, value)
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 8)
+	return applied, err
 }
 
 // MultipassConfigFlagValues holds parsed values; only visited flags are applied.
@@ -117,16 +70,9 @@ type MultipassConfigFlagValues struct {
 
 // RegisterMultipassConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterMultipassConfigFlags(fs *flag.FlagSet, defaults MultipassConfig) MultipassConfigFlagValues {
-	return MultipassConfigFlagValues{
-		CLIPath:       fs.String("multipass-cli", defaults.CLIPath, "Multipass CLI path"),
-		Image:         fs.String("multipass-image", defaults.Image, "Multipass Ubuntu image selector"),
-		User:          fs.String("multipass-user", defaults.User, "SSH user created inside Multipass leases"),
-		WorkRoot:      fs.String("multipass-work-root", defaults.WorkRoot, "remote Crabbox work root inside Multipass leases"),
-		CPUs:          fs.Int("multipass-cpus", defaults.CPUs, "CPU count for Multipass leases; 0 leaves Multipass default"),
-		Memory:        fs.String("multipass-memory", defaults.Memory, "memory size for Multipass leases, for example 8G"),
-		Disk:          fs.String("multipass-disk", defaults.Disk, "disk size for Multipass leases, for example 30G"),
-		LaunchTimeout: fs.String("multipass-launch-timeout", defaults.LaunchTimeout.String(), "Multipass launch timeout"),
-	}
+	var values MultipassConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // MultipassConfigVisitedFlags records raw flag visits, independently of application.
@@ -138,45 +84,14 @@ type MultipassConfigVisitedFlags struct {
 
 // MultipassConfigFlagPresence reports visits for tracked flag bindings.
 func MultipassConfigFlagPresence(fs *flag.FlagSet) MultipassConfigVisitedFlags {
-	return MultipassConfigVisitedFlags{
-		Image:    flagWasSet(fs, "multipass-image"),
-		User:     flagWasSet(fs, "multipass-user"),
-		WorkRoot: flagWasSet(fs, "multipass-work-root"),
-	}
+	var visited MultipassConfigVisitedFlags
+	recordConfigFlagVisits[MultipassConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
 func (values MultipassConfigFlagValues) Apply(cfg *MultipassConfig, fs *flag.FlagSet) (MultipassConfigApplied, error) {
 	var applied MultipassConfigApplied
-	visited := MultipassConfigFlagPresence(fs)
-	if flagWasSet(fs, "multipass-cli") {
-		cfg.CLIPath = *values.CLIPath
-	}
-	if visited.Image {
-		cfg.Image = *values.Image
-		applied.Image = true
-	}
-	if visited.User {
-		cfg.User = *values.User
-		applied.User = true
-	}
-	if visited.WorkRoot {
-		cfg.WorkRoot = *values.WorkRoot
-		applied.WorkRoot = true
-	}
-	if flagWasSet(fs, "multipass-cpus") {
-		cfg.CPUs = *values.CPUs
-	}
-	if flagWasSet(fs, "multipass-memory") {
-		cfg.Memory = *values.Memory
-	}
-	if flagWasSet(fs, "multipass-disk") {
-		cfg.Disk = *values.Disk
-	}
-	if flagWasSet(fs, "multipass-launch-timeout") {
-		if err := ApplyLeaseDuration(&cfg.LaunchTimeout, *values.LaunchTimeout); err != nil {
-			return applied, err
-		}
-	}
-	return applied, nil
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

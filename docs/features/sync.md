@@ -61,10 +61,15 @@ That list is then filtered by the active excludes:
 - repo-local `sync.exclude` (config) patterns;
 - root `.crabboxignore` patterns.
 
-Before transfer, Crabbox checks tracked paths that remain in the effective
-manifest scope. If sparse-checkout rules or `skip-worktree` state hide one of
+Before ordinary SSH lease work, Crabbox checks tracked paths that remain in the
+effective manifest scope; it still rebuilds the final manifest after acquisition.
+If sparse-checkout rules or `skip-worktree` state hide one of
 those paths, sync stops instead of treating the omission as a deletion. Hidden
 paths outside `sync.include` or removed by ordered excludes are ignored.
+Materialize the checkout, or intentionally adjust `sync.include`, ordered
+`sync.exclude`, or `.crabboxignore` to put those paths outside sync scope. Later
+reinclusion rules remain authoritative; fully materialized sparse checkouts
+remain supported.
 Gitlinks are not manifest files or remote file deletions, while symlinks remain
 file-like.
 
@@ -154,6 +159,32 @@ If a project stores source files in one of these reserved directories, move
 them elsewhere before upgrading; reserved runtime paths are no longer eligible
 for sync even when they are tracked or explicitly re-included.
 
+An explicit `XDG_STATE_HOME` adds its exact `crabbox` subtree to protected
+runtime state. The path is literal, not a glob, and includes or negations cannot
+re-enable it. Other files beneath the selected state base remain eligible for
+sync. Crabbox rejects a source root inside the managed namespace instead of
+silently uploading an empty checkout. When this namespace overlaps a checkout,
+Git seeding is disabled so a seeded tree cannot materialize excluded paths.
+These protections do not remove state already committed upstream or previously
+shared with a runner.
+
+On macOS, managed-state path spelling uses entry-name and identity attributes
+relative to a retained parent descriptor, rather than opening the leaf or
+enumerating sibling files. This also supports Unix socket and FIFO entries
+without opening them, while preserving object-identity and namespace checks.
+Crowded temporary directories do not block sync preparation.
+
+Native transports without subtree filtering require the selected managed
+namespace to be outside their shared source scope. This includes Blacksmith's
+native repository sync, Docker Sandbox's repository and extra workspaces, Apple
+Machine's home mount, and Local Container's host volumes and Docker-socket-mode
+host work root.
+Crabbox rejects an overlapping source before transferring or mounting it.
+`--no-sync` does not disable native mounts. Choose a state root outside those
+shared directories; do not rely on `.gitignore` to protect a host mount.
+Explicit file copies, scripts, and arbitrary native arguments are separate
+user-directed operations, not covered by repository filtering.
+
 Repo-local config should hold project-specific excludes and env allowlists.
 Secrets must never be passed as command-line arguments or via broad env globs.
 
@@ -174,6 +205,12 @@ renewal and release fail closed. After a client crash, an expired owner is
 recoverable only when the exact witnessed child is no longer alive. POSIX,
 WSL2, and native Windows targets share these semantics.
 
+Transport failures during renewal, child inspection, and phase-witness waiting
+retain recognized `MISMATCH`, `EXPIRED`, or `AMBIGUOUS` protocol labels alongside
+the original error. These labels add diagnostic context, not permission to
+continue or retry; arbitrary protocol output is not added to those transport
+error messages. An ambiguous inspection still fails closed.
+
 POSIX and WSL2 children register themselves before executing the requested
 workload. Registration waits at most five seconds for the owner lock; it does
 not leave a background child waiting indefinitely for a start file. A failed
@@ -184,6 +221,8 @@ waiting child from running the workload. After handoff, the existing witnessed
 child and recovery rules continue to apply. A denied `kill -0` is never proof
 that a recorded child is dead: cleanup and recovery require independent PID
 absence evidence, and retain authority when observation is ambiguous.
+If a child exits between the signal and start-time probes, the same PID absence
+check allows the completed phase to settle without retrying an ambiguous result.
 
 Once ownership is established, sync runs these steps:
 

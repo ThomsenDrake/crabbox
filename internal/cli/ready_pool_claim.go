@@ -57,7 +57,7 @@ func (c *CoordinatorClient) ClaimReadyPoolAllocation(ctx context.Context, key st
 
 func validateReadyPoolClaim(response CoordinatorReadyPoolClaimResponse, key string, input CoordinatorReadyPoolClaimInput) error {
 	allocation := response.Allocation
-	invalid := func() error { return exit(7, "coordinator returned an invalid or fenced ready-pool allocation") }
+	invalid := func() error { return Exit(7, "coordinator returned an invalid or fenced ready-pool allocation") }
 	if allocation.Schema != "crabbox-ready-pool-allocation/v1" || allocation.OperationID != input.OperationID ||
 		allocation.PoolKey != key || allocation.Identity != input.Identity || !readyPoolLeasePattern.MatchString(allocation.LeaseID) || allocation.SelectedAt == "" {
 		return invalid()
@@ -103,7 +103,7 @@ func (a App) readyPoolClaim(ctx context.Context, args []string) error {
 		return err
 	}
 	if key == "" || !readyPoolOperationPattern.MatchString(*operation) || !readyPoolLeasePattern.MatchString(*coldID) || (*lookup && *selectOnly) {
-		return exit(2, "pool claim requires a key, --operation-id, --cold-lease-id and --identity-file; select-only and lookup-only are exclusive")
+		return Exit(2, "pool claim requires a key, --operation-id, --cold-lease-id and --identity-file; select-only and lookup-only are exclusive")
 	}
 	identity, err := loadReadyPoolIdentity(*identityFile)
 	if err != nil {
@@ -122,7 +122,7 @@ func (a App) readyPoolClaim(ctx context.Context, args []string) error {
 			// Allocation fields contain no claim token or provider diagnostics.
 			_ = json.NewEncoder(a.Stdout).Encode(map[string]any{"allocation": response.Allocation, "error": "pool_claim_failed"})
 		}
-		return exit(7, "ready-pool claim failed; inspect its durable allocation before cleanup")
+		return Exit(7, "ready-pool claim failed; inspect its durable allocation before cleanup")
 	}
 	if *jsonOut {
 		return json.NewEncoder(a.Stdout).Encode(response)

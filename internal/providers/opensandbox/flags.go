@@ -8,11 +8,11 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func RegisterOpenSandboxProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterOpenSandboxProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterOpenSandboxConfigFlags(fs, defaults.OpenSandbox)
 }
 
-func ApplyOpenSandboxProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplyOpenSandboxProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case providerName:
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "use --opensandbox-cpu and --opensandbox-memory", "use --opensandbox-cpu and --opensandbox-memory"); err != nil {
@@ -23,6 +23,10 @@ func ApplyOpenSandboxProviderFlags(cfg *Config, fs *flag.FlagSet, values any) er
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.OpenSandbox, fs)
+	applied, err := v.Apply(&cfg.OpenSandbox, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	if err != nil {
+		return err
+	}
 	return validateOpenSandboxConfig(*cfg)
 }

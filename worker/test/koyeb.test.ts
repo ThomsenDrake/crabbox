@@ -1,8 +1,8 @@
 /* oxlint-disable eslint/no-await-in-loop -- Fleet provisioning phases must advance sequentially. */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { sha256Hex } from "../src/auth";
 import { leaseConfig } from "../src/config";
+import { sha256Hex } from "../src/encoding";
 import { FleetCoordinator, KoyebProvider, readyPoolSeedDigestV1 } from "../src/fleet";
 import { KoyebClient, KoyebHTTPError, KoyebResumableProvisioning } from "../src/koyeb";
 import {

@@ -4,8 +4,6 @@ package cli
 
 import (
 	"flag"
-	"os"
-	"strings"
 )
 
 type fileCoderConfig struct {
@@ -37,6 +35,7 @@ func defaultCoderConfig() CoderConfig {
 
 // CoderConfigApplied records accepted assignments during one application.
 type CoderConfigApplied struct {
+	InputAccepted     bool
 	CLIPath           bool
 	WorkRoot          bool
 	RichParameterFile bool
@@ -44,73 +43,14 @@ type CoderConfigApplied struct {
 
 func (cfg *CoderConfig) applyFile(file *fileCoderConfig) (CoderConfigApplied, error) {
 	var applied CoderConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.CLIPath != "" {
-		cfg.CLIPath = file.CLIPath
-		applied.CLIPath = true
-	}
-	if file.Template != "" {
-		cfg.Template = file.Template
-	}
-	if file.Preset != "" {
-		cfg.Preset = file.Preset
-	}
-	if file.WorkspacePrefix != "" {
-		cfg.WorkspacePrefix = file.WorkspacePrefix
-	}
-	if file.WorkRoot != "" {
-		cfg.WorkRoot = file.WorkRoot
-		applied.WorkRoot = true
-	}
-	if file.DeleteOnRelease != nil {
-		cfg.DeleteOnRelease = *file.DeleteOnRelease
-	}
-	if file.Wait != "" {
-		cfg.Wait = file.Wait
-	}
-	if file.UseParameterDefaults != nil {
-		cfg.UseParameterDefaults = *file.UseParameterDefaults
-	}
-	if len(file.Parameters) > 0 {
-		cfg.Parameters = normalizeList(file.Parameters)
-	}
-	if file.RichParameterFile != "" {
-		cfg.RichParameterFile = file.RichParameterFile
-		applied.RichParameterFile = true
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "coder")
+	return applied, err
 }
 
 func (cfg *CoderConfig) applyEnv() (CoderConfigApplied, error) {
 	var applied CoderConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_CODER_CLI"); ok {
-		cfg.CLIPath = value
-		applied.CLIPath = true
-	}
-	cfg.Template = getenv("CRABBOX_CODER_TEMPLATE", cfg.Template)
-	cfg.Preset = getenv("CRABBOX_CODER_PRESET", cfg.Preset)
-	cfg.WorkspacePrefix = getenv("CRABBOX_CODER_WORKSPACE_PREFIX", cfg.WorkspacePrefix)
-	if value, ok := firstNonEmptyEnv("CRABBOX_CODER_WORK_ROOT"); ok {
-		cfg.WorkRoot = value
-		applied.WorkRoot = true
-	}
-	if value, ok := getenvBool("CRABBOX_CODER_DELETE_ON_RELEASE"); ok {
-		cfg.DeleteOnRelease = value
-	}
-	cfg.Wait = getenv("CRABBOX_CODER_WAIT", cfg.Wait)
-	if value, ok := getenvBool("CRABBOX_CODER_USE_PARAMETER_DEFAULTS"); ok {
-		cfg.UseParameterDefaults = value
-	}
-	if value := os.Getenv("CRABBOX_CODER_PARAMETERS"); strings.TrimSpace(value) != "" {
-		cfg.Parameters = parseEnvListValue(value)
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_CODER_RICH_PARAMETER_FILE"); ok {
-		cfg.RichParameterFile = value
-		applied.RichParameterFile = true
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 10)
+	return applied, err
 }
 
 // CoderConfigFlagValues holds parsed values; only visited flags are applied.
@@ -129,18 +69,9 @@ type CoderConfigFlagValues struct {
 
 // RegisterCoderConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterCoderConfigFlags(fs *flag.FlagSet, defaults CoderConfig) CoderConfigFlagValues {
-	return CoderConfigFlagValues{
-		CLIPath:              fs.String("coder-cli", defaults.CLIPath, "Coder CLI path"),
-		Template:             fs.String("coder-template", defaults.Template, "Coder template for new workspaces"),
-		Preset:               fs.String("coder-preset", defaults.Preset, "Coder template preset"),
-		WorkspacePrefix:      fs.String("coder-workspace-prefix", defaults.WorkspacePrefix, "prefix for Crabbox-managed Coder workspace names"),
-		WorkRoot:             fs.String("coder-work-root", defaults.WorkRoot, "Coder workspace Crabbox work root"),
-		DeleteOnRelease:      fs.Bool("coder-delete-on-release", defaults.DeleteOnRelease, "delete Coder workspace on release instead of stopping it"),
-		Wait:                 fs.String("coder-wait", defaults.Wait, "Coder SSH startup wait mode: yes, no, or auto"),
-		UseParameterDefaults: fs.Bool("coder-use-parameter-defaults", defaults.UseParameterDefaults, "pass --use-parameter-defaults to coder create"),
-		Parameters:           fs.String("coder-parameter", strings.Join(defaults.Parameters, ","), "comma-separated Coder parameter values name=value"),
-		RichParameterFile:    fs.String("coder-rich-parameter-file", defaults.RichParameterFile, "Coder rich parameter file"),
-	}
+	var values CoderConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // CoderConfigVisitedFlags records raw flag visits, independently of application.
@@ -152,49 +83,14 @@ type CoderConfigVisitedFlags struct {
 
 // CoderConfigFlagPresence reports visits for tracked flag bindings.
 func CoderConfigFlagPresence(fs *flag.FlagSet) CoderConfigVisitedFlags {
-	return CoderConfigVisitedFlags{
-		CLIPath:           flagWasSet(fs, "coder-cli"),
-		WorkRoot:          flagWasSet(fs, "coder-work-root"),
-		RichParameterFile: flagWasSet(fs, "coder-rich-parameter-file"),
-	}
+	var visited CoderConfigVisitedFlags
+	recordConfigFlagVisits[CoderConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values CoderConfigFlagValues) Apply(cfg *CoderConfig, fs *flag.FlagSet) CoderConfigApplied {
+func (values CoderConfigFlagValues) Apply(cfg *CoderConfig, fs *flag.FlagSet) (CoderConfigApplied, error) {
 	var applied CoderConfigApplied
-	visited := CoderConfigFlagPresence(fs)
-	if visited.CLIPath {
-		cfg.CLIPath = *values.CLIPath
-		applied.CLIPath = true
-	}
-	if flagWasSet(fs, "coder-template") {
-		cfg.Template = *values.Template
-	}
-	if flagWasSet(fs, "coder-preset") {
-		cfg.Preset = *values.Preset
-	}
-	if flagWasSet(fs, "coder-workspace-prefix") {
-		cfg.WorkspacePrefix = *values.WorkspacePrefix
-	}
-	if visited.WorkRoot {
-		cfg.WorkRoot = *values.WorkRoot
-		applied.WorkRoot = true
-	}
-	if flagWasSet(fs, "coder-delete-on-release") {
-		cfg.DeleteOnRelease = *values.DeleteOnRelease
-	}
-	if flagWasSet(fs, "coder-wait") {
-		cfg.Wait = *values.Wait
-	}
-	if flagWasSet(fs, "coder-use-parameter-defaults") {
-		cfg.UseParameterDefaults = *values.UseParameterDefaults
-	}
-	if flagWasSet(fs, "coder-parameter") {
-		cfg.Parameters = splitCSV(*values.Parameters)
-	}
-	if visited.RichParameterFile {
-		cfg.RichParameterFile = *values.RichParameterFile
-		applied.RichParameterFile = true
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

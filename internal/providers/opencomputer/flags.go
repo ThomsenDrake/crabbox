@@ -7,11 +7,11 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func RegisterOpenComputerProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterOpenComputerProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterOpenComputerConfigFlags(fs, defaults.OpenComputer)
 }
 
-func ApplyOpenComputerProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplyOpenComputerProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "use --opencomputer-cpu and --opencomputer-memory-mb", "use --opencomputer-cpu and --opencomputer-memory-mb"); err != nil {
 			return err
@@ -21,6 +21,7 @@ func ApplyOpenComputerProviderFlags(cfg *Config, fs *flag.FlagSet, values any) e
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.OpenComputer, fs)
-	return nil
+	applied, err := v.Apply(&cfg.OpenComputer, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	return err
 }

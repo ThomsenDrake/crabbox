@@ -3309,14 +3309,13 @@ func TestStopCoordinatorInspectFailureKeepsProviderBinding(t *testing.T) {
 	}
 }
 
-func TestStopCoordinatorMissingLeaseRequiresFreshInventoryAbsence(t *testing.T) {
+func TestStopCoordinatorMissingLeaseDoesNotInferDeletionFromInventory(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		inventoryStatus int
 		leases          []CoordinatorLease
-		wantSuccess     bool
 	}{
-		{name: "confirmed absent", leases: []CoordinatorLease{}, wantSuccess: true},
+		{name: "filtered absent", leases: []CoordinatorLease{}},
 		{name: "still present", leases: []CoordinatorLease{{ID: "cbx_stop_missing", Provider: "aws", State: "active"}}},
 		{name: "inventory unavailable", inventoryStatus: http.StatusInternalServerError},
 	} {
@@ -3356,10 +3355,10 @@ func TestStopCoordinatorMissingLeaseRequiresFreshInventoryAbsence(t *testing.T) 
 			err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
 				"--provider", "aws", "--id", "cbx_stop_missing",
 			})
-			if (err == nil) != test.wantSuccess {
-				t.Fatalf("stop err=%v wantSuccess=%t", err, test.wantSuccess)
+			if err == nil || !isCoordinatorNotFoundError(err) {
+				t.Fatalf("stop err=%v, want original missing-target failure", err)
 			}
-			if releaseRequests == 0 || inventoryRequests != 1 {
+			if releaseRequests == 0 || inventoryRequests != 0 {
 				t.Fatalf("release requests=%d inventory requests=%d", releaseRequests, inventoryRequests)
 			}
 		})

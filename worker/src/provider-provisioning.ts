@@ -91,6 +91,8 @@ export interface ProviderResumableProvisioning {
       deadline: number;
       retain?: boolean;
       recovering: boolean;
+      // Revalidate the claimed operation after provider reads, immediately before cleanup mutation.
+      assertCleanupOwner?: () => Promise<void>;
     } & (
       | { canceled: false; material: ProvisioningMaterial }
       | { canceled: true; material?: never }

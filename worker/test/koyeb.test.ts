@@ -454,6 +454,70 @@ function fleetLeaseRequest() {
   };
 }
 
+function cleanupResourceIdentity(
+  active: LeaseRecord,
+  overrides: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    schema: "crabbox-koyeb-cleanup/v1",
+    scope: active.providerScope,
+    organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+    appID: active.providerProject ?? baseEnv.CRABBOX_KOYEB_APP_ID,
+    region: active.region ?? "was",
+    leaseID: active.id,
+    generation: active.createAttemptGeneration,
+    serviceID: active.cloudID,
+    deploymentID,
+    ttlSeconds: 3_600,
+    idleTimeoutSeconds: 600,
+    ...overrides,
+  });
+}
+
+async function retainCleanupPublication(
+  storage: ProvisioningTestStorage,
+  active: LeaseRecord,
+  resourceIdentity: string,
+): Promise<void> {
+  const now = Date.now();
+  const operation: LeaseProvisioningOperation = {
+    schema: 1,
+    leaseID: active.id,
+    operationID: `published-${active.id}`,
+    generation: active.createAttemptGeneration!,
+    scope: active.providerScope!,
+    owner: active.owner,
+    org: active.org,
+    provider: "koyeb",
+    createdAt: now,
+    deadline: now + 60_000,
+    revision: 0,
+    step: {
+      phase: "terminal",
+      attempt: 0,
+      state: { version: 1, action: "confirm-delete", serviceID: active.cloudID, deploymentID },
+      nextWake: now,
+      publication: {
+        server: {
+          provider: "koyeb",
+          id: 0,
+          cloudID: active.cloudID,
+          region: active.region,
+          name: active.serverName || serviceName,
+          status: "healthy",
+          serverType: active.serverType,
+          host: active.host,
+          labels: {},
+          resourceIdentity,
+        },
+        serverType: active.serverType,
+        market: "on-demand",
+      },
+    },
+  };
+  await storage.put(provisioningOperationKey(active.id), operation);
+}
+
 async function advanceFleetProvisioning(
   storage: ProvisioningTestStorage,
   runtime: ProvisioningTestRuntime,
@@ -489,8 +553,10 @@ async function activeCleanupFixture(transport: "tailscale" | "koyeb-mesh" = "tai
   });
   const state = {
     deletes: 0,
+    present: true,
     requests: [] as string[],
     observations: [] as ProviderCleanupEvidence[],
+    beforeDeployment: undefined as (() => Promise<void>) | undefined,
     observe: () => Response.json({ service: service({ status: "DELETING" }) }),
     delete: () => Response.json({ service: service({ status: "DELETING" }) }),
   };
@@ -503,9 +569,14 @@ async function activeCleanupFixture(transport: "tailscale" | "koyeb-mesh" = "tai
       return state.delete();
     }
     if (path === `/v1/services/${serviceID}`) {
-      return state.deletes ? state.observe() : Response.json({ service: service() });
+      return state.present
+        ? state.deletes
+          ? state.observe()
+          : Response.json({ service: service() })
+        : new Response("not found", { status: 404 });
     }
     if (path === `/v1/deployments/${deploymentID}`) {
+      await state.beforeDeployment?.();
       const owned =
         transport === "koyeb-mesh" ? meshDeployment("u".repeat(32)) : deployment("u".repeat(32));
       owned.definition.env = owned.definition.env.map((entry) =>
@@ -519,6 +590,7 @@ async function activeCleanupFixture(transport: "tailscale" | "koyeb-mesh" = "tai
   });
   const context = {
     assertCleanupOwner: vi.fn<() => Promise<void>>(async () => {}),
+    resourceIdentity: cleanupResourceIdentity(active),
     saveCleanupEvidence: vi.fn<(evidence: ProviderCleanupEvidence) => Promise<void>>(
       async (evidence) => {
         active.providerCleanup = structuredClone(evidence);
@@ -540,6 +612,7 @@ async function activeFleetCleanupFixture(extraEnv: Partial<Env> = {}, io?: Proje
   fixture.active.org = orgKeyForLabel("example-org");
   const storage = new ProvisioningTestStorage();
   await storage.put(`lease:${fixture.active.id}`, fixture.active);
+  await retainCleanupPublication(storage, fixture.active, fixture.context.resourceIdentity);
   const runtime = new ProvisioningTestRuntime(storage);
   const environment = { ...fleetEnv, ...extraEnv };
   const provider = new KoyebProvider(environment, fixture.fetcher);
@@ -845,6 +918,65 @@ describe("Koyeb ready pools and checkpoint lifecycle", () => {
 });
 
 describe("Koyeb active lease deletion confirmation", () => {
+  it("uses the published allocation lifecycle after a heartbeat changes the lease idle policy", async () => {
+    const { active, state, advance } = await activeCleanupFixture();
+    active.idleTimeoutSeconds = 1_200;
+
+    await expect(advance()).resolves.toMatchObject({ status: "pending" });
+    expect(state.deletes).toBe(1);
+  });
+
+  it("rechecks cleanup authority after journaling and immediately before DELETE", async () => {
+    const { state, context, advance } = await activeCleanupFixture();
+    const save = context.saveCleanupEvidence.getMockImplementation()!;
+    context.saveCleanupEvidence.mockImplementation(async (evidence) => {
+      await save(evidence);
+      context.assertCleanupOwner.mockRejectedValue(new Error("synthetic ownership change"));
+    });
+
+    await expect(advance()).rejects.toThrow("stage=delete");
+    expect(state.deletes).toBe(0);
+  });
+
+  it("requires published allocation identity before deleting a present service", async () => {
+    const { state, context, advance } = await activeCleanupFixture();
+    delete context.resourceIdentity;
+
+    await expect(advance()).rejects.toThrow("allocation identity is missing or inconsistent");
+    expect(state.deletes).toBe(0);
+  });
+
+  it("keeps idempotent absence for a legacy publication without allocation identity", async () => {
+    const { state, context, advance } = await activeCleanupFixture();
+    delete context.resourceIdentity;
+    state.present = false;
+
+    await expect(advance()).resolves.toBeUndefined();
+    expect(state.deletes).toBe(0);
+  });
+
+  it.each([
+    ["organizationID", serviceID],
+    ["appID", secondAppID],
+    ["region", "fra"],
+    ["serviceID", latestDeploymentID],
+    ["deploymentID", latestDeploymentID],
+    ["ttlSeconds", 3_599],
+    ["idleTimeoutSeconds", 1_200],
+  ] as const)(
+    "refuses a present service when published %s identity changed",
+    async (field, value) => {
+      const { state, context, advance } = await activeCleanupFixture();
+      context.resourceIdentity = JSON.stringify({
+        ...(JSON.parse(context.resourceIdentity) as Record<string, unknown>),
+        [field]: value,
+      });
+
+      await expect(advance()).rejects.toBeInstanceOf(ProviderResourceUnresolvedError);
+      expect(state.deletes).toBe(0);
+    },
+  );
+
   it.each([
     "DELETING",
     "HEALTHY",
@@ -966,7 +1098,7 @@ describe("Koyeb active lease deletion confirmation", () => {
     active.createAttemptGeneration = "replacement-generation";
     const requestCount = state.requests.length;
     await expect(advance()).rejects.toThrow("retained cleanup evidence does not match");
-    expect(state.requests).toHaveLength(requestCount);
+    expect(state.requests.slice(requestCount)).toEqual([`GET /v1/services/${serviceID}`]);
     expect(state.deletes).toBe(1);
   });
 
@@ -2218,6 +2350,19 @@ describe("Koyeb managed app targets", () => {
         access: { sshPort: "3031", workRoot: "/workspace/crabbox" },
       },
     });
+    expect(JSON.parse(step.publication!.server.resourceIdentity!)).toEqual({
+      schema: "crabbox-koyeb-cleanup/v1",
+      scope: candidate.plan.scope,
+      organizationID: baseEnv.CRABBOX_KOYEB_ORGANIZATION_ID,
+      appID: secondAppID,
+      region: "was",
+      leaseID: selectedLease.id,
+      generation: selectedLease.createAttemptGeneration,
+      serviceID: targetServiceID,
+      deploymentID: targetDeploymentID,
+      ttlSeconds: 3_600,
+      idleTimeoutSeconds: 600,
+    });
     expect(createdBody).toMatchObject({ app_id: secondAppID });
 
     const active = lease({
@@ -2243,6 +2388,7 @@ describe("Koyeb managed app targets", () => {
     const cleanupEvidence: ProviderCleanupEvidence[] = [];
     await expect(
       provider.releaseLease(active, {
+        resourceIdentity: step.publication!.server.resourceIdentity,
         assertCleanupOwner: async () => {},
         saveCleanupEvidence: async (evidence) => {
           active.providerCleanup = structuredClone(evidence);
@@ -2780,6 +2926,7 @@ describe("Koyeb Sandbox coordinator adapter", () => {
 
     await expect(
       client.deleteOwnedService(active, {
+        resourceIdentity: cleanupResourceIdentity(active),
         assertCleanupOwner: async () => {},
         saveCleanupEvidence: async (evidence) => {
           active.providerCleanup = evidence;
@@ -3465,6 +3612,7 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       deadline: Date.now() + 60_000,
       recovering: true,
       canceled: true as const,
+      assertCleanupOwner: vi.fn<() => Promise<void>>(async () => {}),
     });
     let step: ProvisioningStep = {
       ...prepared.step,
@@ -3485,6 +3633,68 @@ describe("Koyeb Sandbox coordinator adapter", () => {
       `DELETE /v1/services/${serviceID}`,
     ]);
   });
+
+  it.each(["valid", "expired", "replaced", "missing"])(
+    "checks %s authority after ownership reads without advancing a refused delete",
+    async (authority) => {
+      const requests: Request[] = [];
+      let checkedRead = false;
+      let revoked = false;
+      const capability = new KoyebResumableProvisioning(baseEnv, async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        requests.push(request);
+        const url = new URL(request.url);
+        if (request.method === "DELETE") return Response.json({});
+        if (url.pathname === `/v1/services/${serviceID}`)
+          return Response.json({ service: service() });
+        if (url.pathname === `/v1/deployments/${deploymentID}`) {
+          await Promise.resolve();
+          checkedRead = true;
+          revoked = authority !== "valid";
+          return Response.json({ deployment: deployment("u".repeat(32)) });
+        }
+        throw new Error("unexpected request");
+      });
+      const prepared = await capability.prepare(config(), lease());
+      const step: ProvisioningStep = {
+        ...prepared.step,
+        phase: "cleanup",
+        state: { version: 1, action: "delete", serviceID, deploymentID },
+      };
+      const assertCleanupOwner = vi.fn<() => Promise<void>>(async () => {
+        expect(checkedRead).toBe(true);
+        if (revoked) throw new Error(`${authority} cleanup claim`);
+      });
+      const result = capability.advance({
+        plan: prepared.plan,
+        step,
+        lease: lease({ providerScope: prepared.plan.scope }),
+        deadline: Date.now() - 1,
+        recovering: true,
+        canceled: true,
+        assertCleanupOwner: authority === "missing" ? undefined : assertCleanupOwner,
+      });
+      const outcome = await result.then(
+        (value) => ({ state: value.state }),
+        (error: Error) => ({ error: error.message }),
+      );
+      expect(outcome).toMatchObject(
+        authority === "valid"
+          ? { state: { action: "confirm-delete" } }
+          : {
+              error:
+                authority === "missing"
+                  ? "Koyeb cleanup requires current coordinator authority"
+                  : `${authority} cleanup claim`,
+            },
+      );
+      expect(checkedRead).toBe(true);
+      expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(
+        authority === "valid" ? 1 : 0,
+      );
+      expect(step.state).toMatchObject({ action: "delete" });
+    },
+  );
 
   it.each([
     ["service", latestDeploymentID, deploymentID],
@@ -3687,6 +3897,28 @@ describe("Koyeb Sandbox coordinator adapter", () => {
 });
 
 describe("Koyeb Fleet integration", () => {
+  it("rechecks the retained publication after provider ownership reads before DELETE", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-08T12:05:00.000Z"));
+    const fixture = await activeFleetCleanupFixture();
+    fixture.state.beforeDeployment = async () => {
+      const key = provisioningOperationKey(fixture.active.id);
+      const operation = (await fixture.storage.get<LeaseProvisioningOperation>(key))!;
+      operation.step.publication!.server.resourceIdentity = cleanupResourceIdentity(
+        fixture.active,
+        { idleTimeoutSeconds: 1_200 },
+      );
+      await fixture.storage.put(key, operation);
+    };
+
+    expect((await fixture.release()).status).toBe(200);
+    const failed = await fixture.tick();
+
+    expect(fixture.state.deletes).toBe(0);
+    expect(failed?.providerCleanup).toBeUndefined();
+    expect(failed?.cleanupError).toContain("Koyeb cleanup failed stage=ownership");
+  });
+
   it.each([
     ["authentication", () => new Response("sensitive-untrusted-body", { status: 401 })],
     ["malformed observation", () => Response.json({})],
@@ -3771,6 +4003,7 @@ describe("Koyeb Fleet integration", () => {
         },
       });
       await storage.put(`lease:${active.id}`, active);
+      await retainCleanupPublication(storage, active, cleanupResourceIdentity(active));
       const put = storage.put.bind(storage);
       vi.spyOn(storage, "put").mockImplementation(async (key, value) => {
         const record = value as LeaseRecord;

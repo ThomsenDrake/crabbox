@@ -19430,6 +19430,23 @@ export class FleetCoordinator {
       assertCleanupOwner: async () => {
         await this.state.runExclusive(async () => {
           const current = await currentCleanupLease();
+          if (resourceIdentity) {
+            const retained = await this.state.storage.get<LeaseProvisioningOperation>(
+              provisioningOperationKey(lease.id),
+            );
+            if (
+              retained?.operationID !== operation?.operationID ||
+              retained?.generation !== lease.createAttemptGeneration ||
+              retained?.step.publication?.server.cloudID !== lease.cloudID ||
+              retained?.step.publication?.server.resourceIdentity !== resourceIdentity
+            ) {
+              throw new Error("lease cleanup publication identity changed");
+            }
+            // The retained publication read can also outlive the cleanup claim.
+            if (cleanupClaimDeadline(current) <= Date.now()) {
+              throw new Error("lease cleanup owner expired");
+            }
+          }
           if (
             canonicalJSONStringify(current.providerCleanup) !==
             canonicalJSONStringify(expectedCleanupEvidence)
@@ -28691,6 +28708,7 @@ export class KoyebProvider implements CloudProvider {
       );
     }
     return this.clientForLease(lease).deleteOwnedService(lease, {
+      ...(context.resourceIdentity ? { resourceIdentity: context.resourceIdentity } : {}),
       assertCleanupOwner: context.assertCleanupOwner,
       saveCleanupEvidence: context.saveCleanupEvidence,
     });

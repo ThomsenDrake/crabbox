@@ -203,7 +203,8 @@ start_owned() {
   local name="$1"
   local expected="$2"
   shift 2
-  env -i PATH="$PATH" HOME=/root "$@" </dev/null >>"${state_root}/${name}.log" 2>&1 &
+  # Keep the operation lock in bootstrap only; daemons outlive this invocation.
+  env -i PATH="$PATH" HOME=/root "$@" 9>&- </dev/null >>"${state_root}/${name}.log" 2>&1 &
   local pid=$!
   printf '%s\n' "$pid" >"${runtime_root}/${name}.pid"
   sleep 0.2

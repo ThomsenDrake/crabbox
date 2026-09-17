@@ -122,7 +122,7 @@ npm ci --prefix worker
 npm run check:node --prefix worker
 npm run build:node --prefix worker
 
-DATABASE_URL='postgresql://crabbox:password@db.example.com/crabbox?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.pem' \
+DATABASE_URL="${DATABASE_URL:?set to your PostgreSQL connection URI}" \
 CRABBOX_SHARED_TOKEN=replace-me \
 CRABBOX_SHARED_OWNER=alice@example.com \
 CRABBOX_DEFAULT_ORG=example-org \

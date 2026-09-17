@@ -140,7 +140,14 @@ const entryVocabulary = {
   field: ["entry_added"],
   pathClass: ["home_top_level"],
   count: ["one"],
-  entryClass: ["local_root", "x_authority_candidate", "ice_authority_candidate", "other_top_level"],
+  entryClass: [
+    "local_root",
+    "x_authority_candidate",
+    "ice_authority_candidate",
+    "desktop_candidate",
+    "dbus_candidate",
+    "other_top_level",
+  ],
   kind: ["file", "directory", "symlink"],
   payload: ["empty", "nonempty", "not_applicable"],
 };

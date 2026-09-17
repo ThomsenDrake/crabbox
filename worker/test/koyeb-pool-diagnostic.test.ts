@@ -106,6 +106,126 @@ it("bounds collection and projects records before logging", async () => {
   ).toEqual([{ event: "runner_pool_diagnostic", ...observation }]);
 });
 
+it.each(
+  ["pool_check", "pool_claim"].flatMap((operation) =>
+    [
+      ["Desktop", "desktop_candidate"],
+      [".dbus", "dbus_candidate"],
+      ["synthetic-private-entry", "other_top_level"],
+    ].map(([name, entryClass]) => ({ operation, name, entryClass })),
+  ),
+)(
+  "preserves the native $operation failure after adding $name",
+  async ({ operation, name, entryClass }) => {
+    const observer = fileURLToPath(new URL("./fixtures/koyeb-pool-diagnostic.py", import.meta.url));
+    const helper = fileURLToPath(
+      new URL("../../images/koyeb-sandbox-runner/project-state.py", import.meta.url),
+    );
+    const script = String.raw`
+import importlib.util,json,os,pathlib,runpy,sys,tempfile
+from unittest.mock import patch
+observer_path,helper_path,operation,name,enabled=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(helper_path).parent))
+def load(module_name,path):
+    spec=importlib.util.spec_from_file_location(module_name,path)
+    module=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+state=load("real_project_state",helper_path)
+observer=load("pool_observer",observer_path)
+observer.HELPER=helper_path
+with tempfile.TemporaryDirectory(prefix="crabbox-home-entry-") as tmp:
+    root=pathlib.Path(tmp)
+    home=root/"home";work=root/"work";control=root/"control"
+    for path in (home,work,control):path.mkdir()
+    observer.OUTPUT=str(root/"events.jsonl")
+    observer.emitted=0
+    if enabled=="yes":
+        with patch.object(sys,"argv",[helper_path]),patch.object(observer.os,"geteuid",return_value=0):
+            observer.activate()
+    state.pool_baseline(control,home)
+    observer.finish_projection()
+    if operation=="pool_claim":
+        state.pool_clean(control,work,home)
+        observer.finish_projection()
+    (home/name).mkdir()
+    (control/"lease-id").write_text("synthetic-lease")
+    request_name="project-request-00000000-0000-0000-0000-000000000000.json"
+    request=control/request_name
+    request.write_text(json.dumps({"action":operation.replace("_","-"),"leaseID":"synthetic-lease","claim":"a"*64}))
+    request_path="/var/lib/crabbox-koyeb/"+request_name
+    paths={"/var/lib/crabbox-koyeb":control,"/workspace/crabbox":work,"/home/crabbox":home,request_path:request}
+    real_path=type(root);real_open=os.open;real_unlink=os.unlink;real_fstat=os.fstat
+    request_identity=request.stat()
+    def redirect(path):return paths.get(os.fspath(path),path)
+    def fixture_open(path,*args,**kwargs):
+        return real_open(redirect(path),*args,**kwargs)
+    def fixture_fstat(fd):
+        info=real_fstat(fd)
+        if (info.st_dev,info.st_ino)!=(request_identity.st_dev,request_identity.st_ino):return info
+        values=list(info);values[4]=0
+        return os.stat_result(values)
+    try:
+        # Redirect only native CLI fixture paths and the request's root ownership.
+        # The unmodified helper supplies dispatch, HOME checks and terminal exit.
+        with patch.object(pathlib,"Path",side_effect=lambda path,*rest:real_path(redirect(path),*rest)), \
+             patch.object(os,"open",side_effect=fixture_open), \
+             patch.object(os,"unlink",side_effect=lambda path,*args,**kwargs:real_unlink(redirect(path),*args,**kwargs)), \
+             patch.object(os,"fstat",side_effect=fixture_fstat), \
+             patch.dict(os.environ,{"CRABBOX_PROJECT_STATE_REQUEST_PATH":request_path}), \
+             patch.object(sys,"argv",[helper_path]):
+            runpy.run_path(helper_path,run_name="__main__")
+    finally:
+        sys.settrace(None)
+        assert not (control/"pool-consumed.json").exists()
+        events=real_path(observer.OUTPUT)
+        if events.exists():print(events.read_text(),end="")
+`;
+    const invoke = (enabled: string) =>
+      execute("python3", ["-c", script, observer, helper, operation, name!, enabled]).then(
+        (result) => ({ code: 0, ...result }),
+        (error: { code: number; stdout: string; stderr: string }) => error,
+      );
+    const plain = await invoke("no");
+    const observed = await invoke("yes");
+    expect(plain.code).toBe(2);
+    expect(observed.code).toBe(plain.code);
+    expect(plain.stdout).toBe("");
+    expect(observed.stderr).toBe(plain.stderr);
+    expect(observed.stderr).toBe('{"error": "checkpoint_project_state_failed"}\n');
+    const records = observed.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(records).toContainEqual({
+      operation,
+      stage: "home_integrity",
+      reason: "home_changed",
+      exception: "value_error",
+      errno: "none",
+    });
+    const entries = records.filter((record) => record.event === "runner_home_entry");
+    expect(entries).toHaveLength(operation === "pool_check" ? 1 : 2);
+    for (const entry of entries) {
+      expect(entry).toEqual({
+        ...homeEntry,
+        operation,
+        reference: entry.reference,
+        entryClass,
+        kind: "directory",
+        payload: "not_applicable",
+      });
+      expect(projectPoolDiagnostic(JSON.stringify(entry))).toEqual(entry);
+    }
+    expect(entries.map((entry) => entry.reference)).toEqual(
+      operation === "pool_check" ? ["bootstrap"] : ["bootstrap", "last_clean"],
+    );
+    for (const privateValue of [name!, "synthetic-lease", "a".repeat(64), "crabbox-home-entry-"]) {
+      expect(observed.stdout + observed.stderr).not.toContain(privateValue);
+    }
+  },
+);
+
 it("preserves real pool check and claim results and terminal filesystem failures with observation", async () => {
   const observer = fileURLToPath(new URL("./fixtures/koyeb-pool-diagnostic.py", import.meta.url));
   const helper = fileURLToPath(

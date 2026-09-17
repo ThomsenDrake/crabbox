@@ -234,7 +234,8 @@ def emit_home_entry(reference, previous, current, document):
     if "/" in path:
         return
     entry_class = ({".local": "local_root", ".Xauthority": "x_authority_candidate",
-                    ".ICEauthority": "ice_authority_candidate"}.get(path, "other_top_level"))
+                    ".ICEauthority": "ice_authority_candidate", "Desktop": "desktop_candidate",
+                    ".dbus": "dbus_candidate"}.get(path, "other_top_level"))
     payload = ("empty" if kind == "file" and entry["data"] == ""
                and entry["sha256"] == EMPTY_SHA256 else
                "nonempty" if kind == "file" else "not_applicable")

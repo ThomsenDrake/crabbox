@@ -157,6 +157,10 @@ needs its own OAuth app: the callback URL must exactly match the public origin, 
 `CRABBOX_PUBLIC_URL` must use that same origin (it is used to build the callback and
 to canonicalize portal redirects). GitHub OAuth refuses to start without this setting,
 and callbacks from another origin are rejected before code exchange or session issuance.
+The Node direct-Host fallback requires the direct `Host` to exactly match the host and
+port in `CRABBOX_PUBLIC_URL`. It does not trust forwarded host, protocol, or
+client-address assertions from unknown peers, so canonical HTTPS routing remains stable
+when provider edge peer addresses change.
 
 For CLI login, the public callback redirects completion to a one-use
 `http://127.0.0.1:<random-port>/crabbox/oauth/<random-path>` listener created by

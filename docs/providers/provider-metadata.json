@@ -573,6 +573,7 @@
     "status": "built-in",
     "category": "brokerable-cloud",
     "coordinator": true,
+    "coordinatorOnly": true,
     "substrate": "Koyeb Sandbox",
     "location": "cloud",
     "ssh": "crabbox-managed",
@@ -581,7 +582,7 @@
     "lifecycle": "Crabbox coordinator and Koyeb",
     "cleanup": "owned Sandbox service delete",
     "bestFit": "Ephemeral Linux desktop, browser, code, and shell sessions on Koyeb",
-    "caveat": "Coordinator-only; requires an immutable runner image and Tailscale OAuth",
+    "caveat": "Requires an immutable runner image and Koyeb API credentials on the coordinator",
     "auth": "Coordinator-owned Koyeb API token and Tailscale OAuth client; no provider credential reaches the CLI or runner",
     "docs": "koyeb.md"
   },

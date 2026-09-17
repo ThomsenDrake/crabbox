@@ -58,15 +58,22 @@ it.each(["malformed synthetic-secret", "null", "[]", "{}"])(
   },
 );
 
-it("retains only the strict runner HOME entry vocabulary", () => {
-  expect(projectPoolDiagnostic(JSON.stringify(homeEntry))).toEqual(homeEntry);
-  expect(projectPoolDiagnostic(JSON.stringify({ ...homeEntry, path: ".ICEauthority" }))).toEqual({
-    event: "runner_pool_diagnostic_unavailable",
-  });
-  expect(projectPoolDiagnostic(JSON.stringify({ ...homeEntry, kind: "directory" }))).toEqual({
-    event: "runner_pool_diagnostic_unavailable",
-  });
-});
+it.each(["pool_check", "pool_claim"])(
+  "retains only the strict %s HOME entry vocabulary",
+  (operation) => {
+    const entry = { ...homeEntry, operation };
+    expect(projectPoolDiagnostic(JSON.stringify(entry))).toEqual(entry);
+    expect(projectPoolDiagnostic(JSON.stringify({ ...entry, path: ".ICEauthority" }))).toEqual({
+      event: "runner_pool_diagnostic_unavailable",
+    });
+    expect(projectPoolDiagnostic(JSON.stringify({ ...entry, kind: "directory" }))).toEqual({
+      event: "runner_pool_diagnostic_unavailable",
+    });
+    expect(projectPoolDiagnostic(JSON.stringify({ ...entry, operation: "baseline" }))).toEqual({
+      event: "runner_pool_diagnostic_unavailable",
+    });
+  },
+);
 
 it("uses a valid isolated Python startup loader without a private-executor request", async () => {
   const commands: string[][] = [];
@@ -99,7 +106,7 @@ it("bounds collection and projects records before logging", async () => {
   ).toEqual([{ event: "runner_pool_diagnostic", ...observation }]);
 });
 
-it("preserves real pool claim results and terminal filesystem failures with observation", async () => {
+it("preserves real pool check and claim results and terminal filesystem failures with observation", async () => {
   const observer = fileURLToPath(new URL("./fixtures/koyeb-pool-diagnostic.py", import.meta.url));
   const helper = fileURLToPath(
     new URL("../../images/koyeb-sandbox-runner/project-state.py", import.meta.url),
@@ -133,14 +140,16 @@ class PoolObserverTests(unittest.TestCase):
             try:
                 state.pool_baseline(control,home)
                 if enabled:observer.finish_projection()
-                results.append(state.pool_clean(control,work,home))
-                if enabled:observer.finish_projection()
-                if kind=="home":
-                    (home/".ICEauthority").write_bytes(b"")
-                if kind=="lock":
-                    lock=os.open(control/"pool.lock",os.O_CREAT|os.O_RDWR,0o600)
-                    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 try:
+                    if kind=="home_check":
+                        (home/".ICEauthority").write_bytes(b"")
+                    results.append(state.pool_clean(control,work,home))
+                    if enabled:observer.finish_projection()
+                    if kind=="home":
+                        (home/".ICEauthority").write_bytes(b"")
+                    if kind=="lock":
+                        lock=os.open(control/"pool.lock",os.O_CREAT|os.O_RDWR,0o600)
+                        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
                     if kind=="sync":
                         with patch.object(state.os,"fsync",side_effect=OSError(errno.EIO,"synthetic-private-error","/private/synthetic")):
                             state.pool_clean(control,work,home,"a"*64)
@@ -152,7 +161,7 @@ class PoolObserverTests(unittest.TestCase):
                 except Exception as failure:
                     error=(type(failure).__name__,str(failure),getattr(failure,"errno",None))
             finally:
-                if enabled and kind=="home":observer.finish_projection()
+                if enabled and kind in ("home","home_check"):observer.finish_projection()
                 sys.settrace(None)
                 if lock is not None:os.close(lock)
             marker=control/"pool-consumed.json"
@@ -163,7 +172,26 @@ class PoolObserverTests(unittest.TestCase):
             self.assertNotIn("/private/synthetic",log)
             self.assertNotIn("a"*64,log)
             self.assertNotIn(str(root),log)
+            self.assertNotIn(".ICEauthority",log)
             return (results,error,marker_content),records
+    def test_first_pool_check_home_failure_remains_exact(self):
+        plain,_=self.exercise("home_check",False);observed,records=self.exercise("home_check",True)
+        self.assertEqual(plain,observed)
+        self.assertEqual(observed[0],[])
+        self.assertEqual(observed[1][0:2],("ValueError","runner home changed after clean bootstrap"))
+        self.assertIsNone(observed[2])
+        self.assertTrue(any(r.get("operation")=="pool_check" and r.get("stage")=="home_integrity" and r.get("reason")=="home_changed" for r in records))
+        self.assertEqual([r for r in records if r.get("event")=="runner_home_entry"],[
+            {"schema":"crabbox-home-entry/v1","event":"runner_home_entry","operation":"pool_check",
+             "reference":"bootstrap","field":"entry_added","pathClass":"home_top_level","count":"one",
+             "entryClass":"ice_authority_candidate","kind":"file","payload":"empty"},
+        ])
+        self.assertEqual([r for r in records if r.get("event")=="runner_home_comparison"],[
+            {"event":"runner_home_comparison","operation":"pool_check","reference":"bootstrap",
+             "reason":"changed","pathClass":"home_top_level","field":"entry_added","count":"one"},
+            {"event":"runner_home_comparison","operation":"pool_check","reference":"last_clean",
+             "reason":"projection_missing","pathClass":"none","field":"none","count":"none"},
+        ])
     def test_home_integrity_failure_remains_exact(self):
         plain,_=self.exercise("home",False);observed,records=self.exercise("home",True)
         self.assertEqual(plain,observed)
@@ -207,6 +235,6 @@ unittest.main(argv=["pool-observer-boundaries"],verbosity=2)
 `;
   const result = await execute("python3", ["-c", script, observer, helper]);
   expect(result.stdout).toBe("");
-  expect(result.stderr).toContain("Ran 5 tests");
+  expect(result.stderr).toContain("Ran 6 tests");
   expect(result.stderr).toContain("OK");
 });

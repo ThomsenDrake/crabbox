@@ -222,7 +222,7 @@ def emit_home(reference, reason, category="none", field="none", count=0):
 
 def emit_home_entry(reference, previous, current, document):
     """Describe one added top-level entry without another HOME read."""
-    if operation != "pool_claim":
+    if operation not in ("pool_check", "pool_claim"):
         return
     old = {row[0] for row in previous["e"]}
     added = [(row, entry) for row, entry in zip(current["e"], document["entries"])
@@ -240,7 +240,7 @@ def emit_home_entry(reference, previous, current, document):
                "nonempty" if kind == "file" else "not_applicable")
     try:
         write_record({"schema": "crabbox-home-entry/v1", "event": "runner_home_entry",
-                      "operation": "pool_claim", "reference": reference,
+                      "operation": operation, "reference": reference,
                       "field": "entry_added", "pathClass": "home_top_level", "count": "one",
                       "entryClass": entry_class, "kind": kind, "payload": payload})
     except Exception:

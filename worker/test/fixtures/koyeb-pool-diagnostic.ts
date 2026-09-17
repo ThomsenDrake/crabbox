@@ -135,7 +135,7 @@ const referenceVocabulary = {
 };
 const entryVocabulary = {
   schema: ["crabbox-home-entry/v1"],
-  operation: ["pool_claim"],
+  operation: ["pool_check", "pool_claim"],
   reference: ["bootstrap", "last_clean"],
   field: ["entry_added"],
   pathClass: ["home_top_level"],

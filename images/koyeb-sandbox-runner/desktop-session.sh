@@ -19,6 +19,10 @@ export XDG_CACHE_HOME="${XDG_RUNTIME_DIR}/desktop-cache"
 export GNUPGHOME="${XDG_RUNTIME_DIR}/gnupg"
 install -d -m 0700 -- "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$GNUPGHOME"
 
+# XFCE can create Desktop after bootstrap records the clean HOME baseline.
+# Establish it synchronously so an idle desktop cannot invalidate a pool claim.
+mkdir -p -- "$HOME/Desktop"
+
 session_pid=""
 session_ready=false
 cleanup() {

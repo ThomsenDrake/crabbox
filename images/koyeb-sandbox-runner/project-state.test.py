@@ -158,6 +158,32 @@ class ProjectStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             state.pool_clean(state_root, self.root, home)
 
+    def test_late_desktop_startup_preserves_pool_claim_but_content_is_denied(self):
+        home, runtime = self.directory / "home", self.directory / "runtime"
+        clean_state, dirty_state = self.directory / "clean-state", self.directory / "dirty-state"
+        for path in (home, runtime, clean_state, dirty_state):
+            path.mkdir()
+
+        # Run the actual synchronous desktop setup, then deterministically defer
+        # XFCE's Desktop creation until after bootstrap and the first pool check.
+        setup, launch, _ = (HERE / "desktop-session.sh").read_text().partition("\n/usr/bin/startxfce4 ")
+        self.assertTrue(launch, "desktop startup boundary must remain explicit")
+        subprocess.run(["bash", "-c", setup], check=True, capture_output=True, text=True,
+                       env={"PATH": os.defpath, "HOME": str(home), "USER": "crabbox",
+                            "LOGNAME": "crabbox", "XDG_RUNTIME_DIR": str(runtime)})
+        for control in (clean_state, dirty_state):
+            state.pool_baseline(control, home)
+            self.assertEqual(state.pool_clean(control, self.root, home)["state"], "clean")
+
+        desktop = home / "Desktop"
+        desktop.mkdir(exist_ok=True)
+        self.assertEqual(state.pool_clean(clean_state, self.root, home, "a" * 64)["state"], "claimed")
+
+        (desktop / "prior-project.txt").write_text("unclaimed project content")
+        with self.assertRaisesRegex(ValueError, "runner home changed after clean bootstrap"):
+            state.pool_clean(dirty_state, self.root, home, "b" * 64)
+        self.assertFalse((dirty_state / "pool-consumed.json").exists())
+
     def test_removed_path_lookup_scales_with_path_depth(self):
         class CountingSet(set):
             def __init__(self, values):

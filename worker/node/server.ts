@@ -12,6 +12,7 @@ import {
   nodeCoordinatorEnv,
   requiresAWSDeploymentReadiness,
 } from "./aws-deployment";
+import { databasePoolsResponse } from "./database-pools";
 import { NodeCoordinatorRuntime, type NodeUpgradeContext } from "./node-runtime";
 import {
   AsyncOperationTracker,
@@ -108,6 +109,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       if (!readBody) {
         request.destroy();
       }
+      return;
+    }
+    const poolResponse = databasePoolsResponse(prepared.request, prepared.authenticated, () =>
+      runtime.databasePools(),
+    );
+    if (poolResponse) {
+      await writeResponse(response, poolResponse, true);
+      request.destroy();
       return;
     }
     if (requiresAWSDeploymentReadiness(prepared.request)) {

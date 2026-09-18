@@ -49,6 +49,13 @@ type StorageMutation =
   | { kind: "deleteAlarm" };
 
 class CapacityStorage extends ProvisioningTestStorage {
+  readonly pool = {
+    totalCount: 0,
+    idleCount: 0,
+    waitingCount: 0,
+    options: { max: 10 },
+    on: vi.fn<(...args: unknown[]) => void>(),
+  };
   readonly mutations: StorageMutation[] = [];
   beforeList?: (options: { prefix?: string; startAfter?: string }) => Promise<void>;
   initialize = vi.fn<() => Promise<void>>(async () => {});

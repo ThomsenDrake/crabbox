@@ -439,6 +439,9 @@ it.skipIf(!image)(
       });
       const client = new KoyebClient(env, fetcher);
       await client.prepareReadyPoolLease(lease);
+      // Exercise the production boundary that previously allowed xfdesktop's
+      // delayed Desktop creation to invalidate an already-clean runner.
+      await delay(1_000);
       await client.claimReadyPoolLease(lease, "a".repeat(64));
       await client.claimReadyPoolLease(lease, "a".repeat(64));
       // A consumed runner must return the helper's exact categorical denial,

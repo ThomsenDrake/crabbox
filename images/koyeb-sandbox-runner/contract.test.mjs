@@ -111,6 +111,15 @@ test("image account and runtime layout permit public-key SSH and an unprivileged
   );
   assert.match(bootstrap, /CRABBOX_KOYEB_SESSION_LOG_ROOT="\$desktop_runtime"/);
   assert.match(desktop, /session_log_root="\$\{CRABBOX_KOYEB_SESSION_LOG_ROOT:-\$\{XDG_RUNTIME_DIR\}\}"/);
+  const desktopDirectory = desktop.indexOf('desktop_directory="${HOME}/Desktop"');
+  const desktopDirectoryInstall = desktop.indexOf('"$desktop_directory"');
+  const desktopStart = desktop.indexOf("/usr/bin/startxfce4");
+  assert.ok(
+    desktopDirectory >= 0 &&
+      desktopDirectoryInstall > desktopDirectory &&
+      desktopStart > desktopDirectoryInstall,
+    "the deterministic Desktop directory must exist before the session can report ready",
+  );
   assert.doesNotMatch(desktop, /CRABBOX_KOYEB_STATE_ROOT/);
   assert.match(teardown, /install -d -m 0711 -o root -g root "\$runtime_root"/);
   assert.match(teardown, /\/var\/lib\/crabbox\/authorized_keys/);

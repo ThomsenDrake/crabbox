@@ -17,7 +17,10 @@ session_log_root="${CRABBOX_KOYEB_SESSION_LOG_ROOT:-${XDG_RUNTIME_DIR}}"
 export XDG_CONFIG_HOME="${XDG_RUNTIME_DIR}/desktop-config"
 export XDG_CACHE_HOME="${XDG_RUNTIME_DIR}/desktop-cache"
 export GNUPGHOME="${XDG_RUNTIME_DIR}/gnupg"
-install -d -m 0700 -- "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$GNUPGHOME"
+# Xfdesktop creates this directory asynchronously. Establish it before the
+# bootstrap records the clean HOME baseline so pool admission cannot race it.
+desktop_directory="${HOME}/Desktop"
+install -d -m 0700 -- "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$GNUPGHOME" "$desktop_directory"
 
 session_pid=""
 session_ready=false
